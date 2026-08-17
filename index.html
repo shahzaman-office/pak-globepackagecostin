@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pak-Globe Umrah Costing</title><link rel="icon" type="image/png" href="favicon.png?v=2" sizes="512x512">
+<link rel="shortcut icon" href="favicon.png?v=2">
+<link rel="apple-touch-icon" href="favicon.png?v=2">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Noto+Nastaliq+Urdu:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="LS"><div class="spin"></div><p id="LSt">Connecting...</p><div class="err" id="LSe"></div></div>
+<div id="TC"></div>
+
+<div id="LP">
+<div class="l-blob l-blob1"></div>
+<div class="l-blob l-blob2"></div>
+<div class="l-blob l-blob3"></div>
+<div class="l-blob l-blob4"></div>
+
+<div class="lbox">
+<div class="lbox-border-glow"></div>
+<div class="lbrand">
+<div class="lbrand-top-row">
+<div class="vip-badge">✨ VIP Umrah Costing Suite</div>
+<div class="secure-badge">🛡️ Encrypted & Synced</div>
+</div>
+
+<div class="kaaba-art-wrap">
+<img src="assets/login_kaaba.jpg" alt="Umrah Costing System" class="l-kaaba-img">
+<div class="kaaba-glow-ring"></div>
+</div>
+
+<div class="lgo">
+<img id="lLgo" src="" style="display:none">
+<div class="lgo-fb" id="lLgoFb">P</div>
+<div>
+<h1>Pak Globe Travels</h1>
+<div class="sub" id="lLic">GL # 5807 • HYDERABAD</div>
+</div>
+</div>
+
+<p class="desc">Next-Generation Professional Umrah Package Costing & Quotation Management Platform</p>
+
+<div class="feats">
+<div class="feat"><span class="ic">🏨</span> Hotel & Transport Auto Rate Engine</div>
+<div class="feat"><span class="ic">📋</span> Multi-Option Costing (Option A / B / C)</div>
+<div class="feat"><span class="ic">⚡</span> Instant 100ms Draft Auto-Save</div>
+<div class="feat"><span class="ic">📱</span> Direct WhatsApp Share & PDF Generator</div>
+</div>
+</div>
+
+<div class="lcard">
+<div class="lc-logo">
+<img id="lcLgo" src="" style="display:none">
+<div class="lc-logo-fb" id="lcLgoFb">P</div>
+</div>
+<h2>Welcome Back</h2>
+<div class="lsub">Sign in to your costing dashboard</div>
+
+<form id="loginForm" autocomplete="on" onsubmit="handleLoginSubmit(event)">
+<div class="fg">
+<label>Username</label>
+<div class="inp-w">
+<span class="field-ic">👤</span>
+<input id="lgU" name="username" placeholder="Enter username" autocomplete="username" required>
+</div>
+</div>
+
+<div class="fg">
+<label>Password</label>
+<div class="inp-w">
+<span class="field-ic">🔒</span>
+<input type="password" id="lgP" name="password" placeholder="Enter password" autocomplete="current-password" required>
+<button type="button" class="pw-t" onclick="togglePw()" title="Toggle password visibility">👁</button>
+</div>
+</div>
+
+<div class="fg" style="display:flex;align-items:center;gap:8px;margin:2px 0 6px">
+<input type="checkbox" id="lgRem" checked style="width:auto;margin:0;cursor:pointer">
+<label for="lgRem" style="margin:0;font-size:.8rem;color:var(--t2);font-weight:500;cursor:pointer">Keep me logged in on this device</label>
+</div>
+
+<div class="lerr" id="lgE"></div>
+<button class="lbtn" id="lgB" type="submit">
+<span>SIGN IN TO DASHBOARD</span>
+<span class="lbtn-arrow">→</span>
+</button>
+</form>
+
+<div class="dev-credit">Powered by <b>Pak Globe Travels System</b> • Developed by <b>Shahzaman</b></div>
+</div>
+</div>
+</div>
+
+<div id="APP">
+<div class="sb-overlay" id="sbOv" onclick="closeSB()"></div>
+<nav class="sidebar closed" id="SB">
+<div class="sb-h">
+<img id="sbL" src="" style="display:none">
+<div class="sb-h-fb" id="sbLFb">P</div>
+<div class="nm">Pak Globe Travels<br><small>GL # 5807</small></div>
+<button class="sb-close" onclick="closeSB()">✕</button>
+</div>
+<div class="sb-n" id="SN"></div>
+<div class="sb-f">© 2024 • Dev: Shahzaman</div>
+</nav>
+<div class="main">
+<header class="top">
+<button class="ham" onclick="toggleSB()" aria-label="Menu">☰</button>
+<span class="tt" id="PT">Dashboard</span>
+<div class="gsearch-wrap"><input id="gSearch" class="gsearch-input" placeholder="Search quotations, hotels..." autocomplete="off"><div id="gSearchResults" class="gsearch-results"></div></div>
+<button id="rfB" onclick="refreshAll()" title="Refresh data">🔄</button>
+<button id="thB" onclick="toggleTheme()">🌙</button>
+<div class="usr"><span class="un" id="TU">-</span><span class="bd bd-a" id="TR">admin</span><button class="btn btn-sm btn-o" onclick="doLogout()">Logout</button></div>
+</header>
+<div class="cnt" id="CT"></div>
+</div>
+</div>
+
+<div id="printOverlay">
+<div id="printBar">
+<h3 style="white-space:nowrap">🖨 Print Preview</h3>
+<div class="pbtns">
+<button style="background:#25D366;color:#fff" onclick="shareWhatsAppCurrentPrint()" title="Share quotation text directly to WhatsApp">📱 Send to WhatsApp</button>
+<button style="background:#7c3aed;color:#fff" onclick="loadPdfLibs().then(downloadPdfNow)" title="Download PDF — pixel-perfect, same as preview">⬇ Download PDF</button>
+<button style="background:#10b981;color:#fff" onclick="doPrintNow()" title="Print / Save as PDF via browser">🖨 Print / Save PDF</button>
+<button style="background:#ef4444;color:#fff" onclick="closePrintPreview()">✕ Close</button>
+</div>
+</div>
+<div id="printBody"></div>
+</div>
+
+<div id="PA"></div>
+<div id="MD"></div>
+
+<script src="utils.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
