@@ -838,52 +838,94 @@ async function _getBackupDirHandle(){
 
 /* Har backup (change/hourly/manual) yahi se save hota hai — pehle chosen folder try karta hai,
    agar available na ho to normal browser download par fallback karta hai */
+function _buildBackupFromMemory(){
+  const hotelsRaw = {};
+  (S.cities||[]).forEach(c => {
+    hotelsRaw[c.key] = S.hotels[c.key] || [];
+  });
+  const totalHotels = Object.values(hotelsRaw).reduce((acc, list) => acc + (Array.isArray(list) ? list.length : Object.keys(list||{}).length), 0);
+  const totalQuotations = Object.keys(S.quotations||{}).length;
+  const totalTransport = Array.isArray(S.transport) ? S.transport.length : Object.keys(S.transport||{}).length;
+
+  return {
+    _backupMeta: {
+      timestamp: new Date().toISOString(),
+      version: "v8-optimized",
+      createdBy: S.user?.u || "system",
+      totalQuotations,
+      totalHotels,
+      totalTransport
+    },
+    users: S.users || {},
+    settings: S.settings || {},
+    hotels: hotelsRaw,
+    transport: S.transport || [],
+    quotations: S.quotations || {},
+    branches: S.branches || {},
+    lists: {
+      airlines: S.airlines || [],
+      classes: S.classes || [],
+      vehicles: S.vehicles || [],
+      rooms: S.rooms || []
+    },
+    cities: S.cities || []
+  };
+}
+
+function _triggerDirectDownload(blob, filename){
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.style.display = "none";
+    a.href = url;
+    a.download = filename;
+    a.setAttribute("download", filename);
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 2500);
+    return true;
+  } catch(e) {
+    console.error("[Backup] Direct download error:", e);
+    return false;
+  }
+}
+
 async function _saveBackupFile(data,filename){
-  try{
-    const dir=await _getBackupDirHandle();
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+  try {
+    const dir = await _getBackupDirHandle();
     if(dir){
-      const fh=await dir.getFileHandle(filename,{create:true});
-      const w=await fh.createWritable();
-      await w.write(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}));
+      const fh = await dir.getFileHandle(filename, { create: true });
+      const w = await fh.createWritable();
+      await w.write(blob);
       await w.close();
-      console.log("[Backup] Saved to chosen folder:",filename);
+      console.log("[Backup] Saved to chosen folder:", filename);
       return true;
     }
-  }catch(e){console.warn("[Backup] Folder save failed, falling back to download:",e.message)}
-  _downloadJson(data,filename);
+  } catch(e) {
+    console.warn("[Backup] Folder save failed:", e.message);
+  }
   return false;
 }
 
 function _downloadJson(data,filename){
-  try{
-    const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement("a");a.href=url;a.download=filename;
-    document.body.appendChild(a);a.click();
-    setTimeout(()=>{URL.revokeObjectURL(url);a.remove()},1000);
-  }catch(e){console.warn("[Backup] Download failed:",e.message)}
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+  _triggerDirectDownload(blob, filename);
 }
 
 async function _collectFullBackup(){
-  const FR30=p=>wt(sbRpc("db_read",{p}),30000);
-  try{
-    const[users,settings,hotels_raw,transport,quotations,branches,lists,cities]=await Promise.all([
-      FR30("users").catch(()=>null),
-      FR30("settings").catch(()=>null),
-      // hotels ke liye har city ka data
-      Promise.all((S.cities||[{key:"makkah"},{key:"madina"}]).map(c=>FR30("hotels/"+c.key).catch(()=>null))).then(results=>{const obj={};(S.cities||[]).forEach((c,i)=>obj[c.key]=results[i]||[]);return obj}),
-      FR30("transport").catch(()=>null),
-      FR30("quotations").catch(()=>null),
-      FR30("branches").catch(()=>null),
-      FR30("lists").catch(()=>null),
-      FR30("cities").catch(()=>null)
-    ]);
-    return{_backupMeta:{timestamp:new Date().toISOString(),version:"v7",createdBy:S.user?.u||"system",totalQuotations:Object.keys(quotations||{}).length,totalHotels:Object.values(hotels_raw||{}).reduce((a,l)=>a+(Array.isArray(l)?l.length:Object.keys(l||{}).length),0)},users,settings,hotels:hotels_raw,transport,quotations,branches,lists,cities};
-  }catch(e){console.warn("[Backup] Collect failed:",e.message);return null}
+  try {
+    await Promise.all((S.cities||[]).map(c => ensureHotelsLoaded(c.key).catch(()=>{})));
+    return _buildBackupFromMemory();
+  } catch(e) {
+    return _buildBackupFromMemory();
+  }
 }
 
-/* Change Backup: Data change hone par "dirty" flag set hota hai,
-   aur har 5 minute mein ek dafa check karke download hota hai (agar kuch change hua ho) */
+/* Change Backup: Data change hone par fast in-memory checkpoint prepare hota hai */
 let _backupDirty=false;
 let _liveBackupDebounce=null;
 window._triggerChangeBackup=function(label){
@@ -891,16 +933,12 @@ window._triggerChangeBackup=function(label){
   _backupDirty=true;
   _lastChangeLabel=label||"update";
   clearTimeout(_liveBackupDebounce);
-  _liveBackupDebounce=setTimeout(_doLiveBackupIfDirty,1500);
+  _liveBackupDebounce=setTimeout(_doLiveBackupIfDirty,3000);
 };
 let _lastChangeLabel="update";
 let _changeBackupInterval=null;
 
-/* ===== LIVE CONTINUOUS BACKUP =====
-   Ek hi file ("PGT_LiveBackup_LATEST.json") har modification par update hoti rehti hai.
-   Agar koi data delete/kam ho to LATEST.json overwrite nahi hoti — us reduced state
-   ko ek alag NEW CHECKPOINT file (PGT_CHECKPOINT_<time>.json) mein save kiya jata hai
-   taake last complete backup hamesha safe rahe. Hourly backups are removed. */
+/* ===== LIVE CONTINUOUS BACKUP (ZERO LAG & FOLDER SAFE) ===== */
 let _lastBackupCounts=null;
 function _countData(data){
   const hotels=Object.values(data.hotels||{}).reduce((a,l)=>a+(Array.isArray(l)?l.length:Object.keys(l||{}).length),0);
@@ -909,44 +947,70 @@ function _countData(data){
   const users=Object.keys(data.users||{}).length;
   return{hotels,transport,quotations,users};
 }
+
 async function _doLiveBackupIfDirty(){
   if(!_backupDirty||!S.user)return;
+  _backupDirty=false;
   try{
-    const data=await _collectFullBackup();
+    const dir=await _getBackupDirHandle();
+    if(!dir)return; // Only auto-save if user configured a backup folder (avoids spamming browser download trays)
+
+    const data=_buildBackupFromMemory();
     if(!data)return;
-    const hash=JSON.stringify(data.quotations||"")+JSON.stringify(Object.keys(data.hotels||{}).map(k=>[k,Array.isArray(data.hotels[k])?data.hotels[k].length:Object.keys(data.hotels[k]||{}).length]))+JSON.stringify(data.transport||"")+JSON.stringify(data.users||"");
-    if(hash===_lastChangeBackupHash){_backupDirty=false;return}
-    _lastChangeBackupHash=hash;_backupDirty=false;
     const counts=_countData(data);
+    const hash=`${counts.hotels}:${counts.transport}:${counts.quotations}:${counts.users}`;
+    if(hash===_lastChangeBackupHash)return;
+    _lastChangeBackupHash=hash;
+
     const shrank=_lastBackupCounts&&(counts.hotels<_lastBackupCounts.hotels||counts.transport<_lastBackupCounts.transport||counts.quotations<_lastBackupCounts.quotations||counts.users<_lastBackupCounts.users);
     if(shrank){
       const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
       await _saveBackupFile(data,`PGT_CHECKPOINT_${ts}.json`);
-      console.log("[LiveBackup] Data shrank vs last snapshot — saved as NEW checkpoint file, LATEST.json untouched.",_lastBackupCounts,"->",counts);
+      console.log("[LiveBackup] Checkpoint created:", `PGT_CHECKPOINT_${ts}.json`);
     }else{
       await _saveBackupFile(data,"PGT_LiveBackup_LATEST.json");
     }
     _lastBackupCounts=counts;
   }catch(e){console.warn("[LiveBackup] Error:",e.message)}
 }
+
 function _startChangeBackupInterval(){
   if(_changeBackupInterval)clearInterval(_changeBackupInterval);
-  _changeBackupInterval=setInterval(_doLiveBackupIfDirty,3000);
+  _changeBackupInterval=setInterval(_doLiveBackupIfDirty,45000); // 45s relaxed interval
 }
 
 function _startHourlyBackup(){
   _startChangeBackupInterval();
 }
 
-/* Manual full backup button ke liye */
+/* Manual full backup button ke liye (Direct instant browser download) */
 window.manualFullBackup=async function(){
   if(!P("backup","view"))return toast("Not allowed — backup permission required","err");
-  toast("Downloading full backup...");
-  const data=await _collectFullBackup();
-  if(!data){toast("Backup failed","err");return}
-  const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
-  await _saveBackupFile(data,"PGT_Manual_Backup_"+ts+".json");
-  toast("✅ Full backup downloaded!");
+  toast("Preparing full backup...");
+  try{
+    await Promise.all((S.cities||[]).map(c=>ensureHotelsLoaded(c.key).catch(()=>{})));
+    const data=_buildBackupFromMemory();
+    const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+    const filename="PGT_Manual_Backup_"+ts+".json";
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json;charset=utf-8"});
+
+    const ok=_triggerDirectDownload(blob,filename);
+    if(!ok){
+      const blobUrl=URL.createObjectURL(blob);
+      showModal("Download Backup",`
+        <div style="text-align:center;padding:12px">
+          <p style="margin-bottom:12px;font-size:.85rem">Your backup is ready <b>(${data._backupMeta.totalHotels} hotels, ${data._backupMeta.totalQuotations} quotations)</b>.</p>
+          <a href="${blobUrl}" download="${filename}" class="btn btn-p" onclick="closeModal()">📥 Download ${filename}</a>
+        </div>
+      `);
+    }
+    // Also save to folder handle if configured
+    _saveBackupFile(data,filename).catch(()=>{});
+    toast(`✅ Backup downloaded (${data._backupMeta.totalHotels} hotels, ${data._backupMeta.totalQuotations} quotations)!`);
+  }catch(err){
+    console.error("[ManualBackup] Error:",err);
+    toast("Backup failed: "+err.message,"err");
+  }
 };
 
 /* Badi restore writes ko chhote batches mein chalao — 50-100MB+ backups bhi
@@ -1970,10 +2034,11 @@ function buildWhatsAppText(data){
   const email = s.email ? `\n*Email:* ${s.email}` : "";
   const address = s.address ? `\n*Address:* ${s.address}` : "";
 
+  const isIntl=Boolean(data.isIntl||data.isInternational);
   const lines = [];
   lines.push("================================");
   lines.push(`*${comp}*${lic}`);
-  lines.push("*UMRAH PACKAGE QUOTATION*");
+  lines.push(isIntl ? "*INTERNATIONAL PACKAGE QUOTATION*" : "*UMRAH PACKAGE QUOTATION*");
   lines.push("================================");
   lines.push("");
 
@@ -2804,11 +2869,12 @@ async function renderPvtPdf(pdf,d,s){
   if(!vo.length){toast("No data","warn");return}
   let td=n(vo[0]?.[1]?.days);if(!td&&vo[0]){vo[0][1].hotels?.forEach(h=>td+=n(h.ngt));td++}
   const fo=vo[0]?.[1];
-  const icards=()=>[{ico:"🧾",lbl:"Invoice #",val:d.invoiceNo||"-"},{ico:"📅",lbl:"Date",val:d.createdAt?.split("T")[0]||"-"},{ico:"👤",lbl:"Prepared By",val:fullNameOf(d.createdBy)||"-"},{ico:"💼",lbl:"Package Type",val:"Customized Umrah"}];
+  const isIntl=Boolean(d.isIntl||d.isInternational);
+  const icards=()=>[{ico:"🧾",lbl:"Invoice #",val:d.invoiceNo||"-"},{ico:"📅",lbl:"Date",val:d.createdAt?.split("T")[0]||"-"},{ico:"👤",lbl:"Prepared By",val:fullNameOf(d.createdBy)||"-"},{ico:"💼",lbl:"Package Type",val:isIntl?"International Package":"Customized Umrah"}];
   pdfPageBorder(pdf,pw,ph);
   let y=8;
   y=pdfHeader(pdf,s,pw,y);
-  y=pdfTitleBar(pdf,y,pw,"CUSTOMIZED UMRAH PACKAGE");
+  y=pdfTitleBar(pdf,y,pw,isIntl?"INTERNATIONAL PACKAGE COSTING":"CUSTOMIZED UMRAH PACKAGE");
   y=pdfIcards(pdf,y,pw,icards());
   y=pdfCinfo(pdf,y,pw,
     [{lbl:"Client:",val:d.clientName||""},{lbl:"Adults:",val:fo?.adultPax||"0"},{lbl:"Child:",val:fo?.childPax||"0"},{lbl:"Infant:",val:fo?.infantPax||"0"},{lbl:"Days:",val:td||""}],
@@ -3417,73 +3483,14 @@ const pendingListHtml=pendingPreviewList.length?`
 
 pg.innerHTML=`<div class="stats"><div class="st"><span class="icn">📋</span><h4>${dashTitle}</h4><div class="v">${my.length}</div></div><div class="st g"><span class="icn">📝</span><h4>Private</h4><div class="v">${pv.length}</div></div><div class="st o"><span class="icn">👥</span><h4>Group</h4><div class="v">${gr.length}</div></div><div class="st pu"><span class="icn">🏨</span><h4>Hotels</h4><div class="v" id="dashHotelCount">${Object.values(S.hotels).reduce((a,l)=>a+(l?.length||0),0)}</div></div></div>
 
-<div class="dash-viz-grid">
-  <!-- Total Quotations This Month Widget -->
-  <div class="dash-viz-card">
-    <div class="dash-viz-hdr">
-      <div class="dash-viz-title">📊 Total Quotations This Month</div>
-      <span class="bd bd-a" style="font-size:.65rem">${curMonthLabel}</span>
-    </div>
-    <div class="dash-viz-stat-row">
-      <div>
-        <div class="dash-viz-main-num">${thisMonthTotal} <span style="font-size:.85rem;font-weight:600;color:var(--t2)">quotes</span></div>
-        <div class="dash-viz-sub-num">PKR ${fmt(thisMonthAmount)} Total Quoted</div>
-      </div>
-      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-        <span class="dash-trend-pill ${trendClass}">${trendHtml}</span>
-        <span style="font-size:.64rem;color:var(--t2)">Pvt: <b>${thisMonthPvt}</b> • Grp: <b>${thisMonthGrp}</b></span>
-      </div>
-    </div>
-    <div class="dash-chart-container" id="dashMonthlyChart"></div>
-  </div>
 
-  <!-- Pending Approvals Widget -->
-  <div class="dash-viz-card">
-    <div class="dash-viz-hdr">
-      <div class="dash-viz-title">⏳ Quotation Approvals</div>
-      <span class="status-pill ${pendingCount>0?'pending':'approved'}">${pendingCount} Pending</span>
-    </div>
-    <div class="dash-donut-container">
-      <div class="dash-donut-svg-wrap">
-        <div id="dashApprovalChart" style="width:130px;height:130px"></div>
-        <div class="dash-donut-center-text">
-          <div class="dash-donut-pct">${approvalRate}%</div>
-          <div class="dash-donut-lbl">Approved</div>
-        </div>
-      </div>
-      <div class="dash-legend">
-        <div class="dash-legend-item">
-          <span><span class="dash-legend-dot" style="background:#f59e0b"></span>Pending:</span>
-          <b>${pendingCount} <span style="font-weight:500;font-size:.66rem;color:var(--t2)">(PKR ${fmt(pendingAmount)})</span></b>
-        </div>
-        <div class="dash-legend-item">
-          <span><span class="dash-legend-dot" style="background:#10b981"></span>Approved:</span>
-          <b>${approvedCount} <span style="font-weight:500;font-size:.66rem;color:var(--t2)">(PKR ${fmt(approvedAmount)})</span></b>
-        </div>
-        ${rejectedCount>0?`
-        <div class="dash-legend-item">
-          <span><span class="dash-legend-dot" style="background:#ef4444"></span>Rejected:</span>
-          <b>${rejectedCount}</b>
-        </div>`:''}
-      </div>
-    </div>
-    <div style="border-top:1px solid var(--bd);padding-top:8px">
-      <div style="font-size:.68rem;font-weight:700;color:var(--t2);text-transform:uppercase;margin-bottom:4px">Pending Review Queue</div>
-      ${pendingListHtml}
-    </div>
-  </div>
-</div>
 
 <div class="g2">
 <div class="cd"><div class="cd-h">🏆 Top Clients</div>${topClients.length?`<div class="top-clients">${topClients.map(([name,amt],i)=>`<div class="top-client-row"><div class="tc-rank">${i+1}</div><div class="tc-name">${_esc(name)}</div><div class="tc-amt">PKR ${fmt(amt)}</div></div>`).join("")}</div>`:`<p style="text-align:center;padding:12px;color:var(--t2);font-size:.78rem">No data yet</p>`}</div>
 <div class="cd"><div class="cd-h">Quick Actions</div><div style="display:flex;flex-direction:column;gap:5px">${P("quot","add")||P("pvt","add")?`<button class="btn btn-p" onclick="editKey=null;nav('pvt')" style="width:100%;justify-content:center">New Private Package</button>`:""}${P("quot","add")||P("grp","add")?`<button class="btn btn-a" onclick="editKey=null;nav('grp')" style="width:100%;justify-content:center">New Group Package</button>`:""}${P("quot","view")?`<button class="btn btn-o" onclick="nav('quot')" style="width:100%;justify-content:center">📋 My Quotations</button>`:""}${seeAll?`<button class="btn btn-o" onclick="nav('allquot')" style="width:100%;justify-content:center">🗂 All Quotations (Admin)</button>`:""}<button class="btn btn-o" onclick="nav('dup')" style="width:100%;justify-content:center">🔁 Duplicate Finder</button></div></div></div>
 <div class="cd" style="margin-top:10px"><div class="cd-h">Recent ${seeAll?"(All Users)":"(My)"}</div><div class="ql" id="dQ"></div></div>`;
 
-// Render D3 charts after DOM insertion
-setTimeout(()=>{
-  renderDashMonthlyTrendChart("dashMonthlyChart",trend6mData);
-  renderDashApprovalDonutChart("dashApprovalChart",statusData);
-},20);
+
 
 /* HOTEL COUNT LIVE UPDATE: hotels background mein load hoti hain — pehle
    dashboard 0 dikha deta tha. Ab jaise hi cities ki hotels aati hain count
@@ -3507,10 +3514,51 @@ setTimeout(()=>{
 const dq=$("dQ");my.slice(-6).reverse().forEach(([k,v])=>{const updNoteDash=v.updatedBy&&v.updatedBy!==v.createdBy?` • Updated by ${fullNameOf(v.updatedBy)}`:"";const ownerInfo=seeAll?` <span style="font-size:.62rem;background:#e0e7ff;color:#3730a3;padding:1px 5px;border-radius:8px">${fullNameOf(v.createdBy)||v.createdBy}</span>`:``;const stVal=v.status||"pending";const stBadge=`<span class="status-pill ${stVal}">${stVal}</span>`;dq.innerHTML+=`<div class="qc"><div class="qi"><div class="qn">${_esc(v.clientName)||"—"} <span class="bd bd-${v.type==="group"?"a":"u"}">${v.type}</span> ${stBadge}${ownerInfo}</div><div class="qm">${_esc(v.invoiceNo)||""} • ${fmtDT(v.createdAt)}${updNoteDash}</div></div><div class="qa">PKR ${fmt(v.totalAdult||0)}</div><div class="qb"><button class="btn-icon" onclick="viewQ('${k}')">👁</button><button class="btn-icon" style="color:var(--teal)" onclick="cloneQuotation('${k}')" title="Clone">📋</button></div></div>`});
 if(!my.length)dq.innerHTML=`<p style="text-align:center;padding:16px;color:var(--t2)">No quotations yet</p>`}
 
-function pgPvt(pg){const roeDef=S.settings?.defaultROE||78;pg.innerHTML=`<div class="cd"><div class="cd-h">Private Package <span id="pEditTag"></span><div style="display:flex;gap:5px;flex-wrap:wrap"><button class="btn btn-o btn-sm" id="pCancelEditBtn" onclick="cancelEdit('pvt')">Cancel</button> <button class="btn btn-o btn-sm" onclick="saveQuotationDraftShortcut('pvt')" title="Save Draft (Ctrl + S)">💾 Save Draft</button> <button class="btn btn-o btn-sm" onclick="pPreview()" title="Print Preview (Ctrl + P)">Preview</button> <button class="btn btn-sm" style="background:#25D366;color:#fff" onclick="shareWhatsAppPvt()">📱 WhatsApp</button> <button class="btn btn-sm" style="background:#7c3aed;color:#fff" onclick="printCostingPvt()">🖨 Print Costing</button> <button class="btn btn-a btn-sm" id="pSaveBtn" onclick="pSave()" title="Save & Print (Ctrl + Enter)">Save & Print</button></div></div>
+function pgPvt(pg){const roeDef=S.settings?.defaultROE||78;pg.innerHTML=`<div class="cd"><div class="cd-h"><span>Private Package <span id="pEditTag"></span></span><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"><label style="display:inline-flex;align-items:center;gap:6px;font-size:.78rem;font-weight:700;cursor:pointer;color:var(--p);background:var(--p-soft);padding:5px 11px;border-radius:6px;border:1px solid var(--p-bd);user-select:none"><input type="checkbox" id="pIsIntl" onchange="triggerCalc()"> 🌐 International Package</label><button class="btn btn-o btn-sm" id="pCancelEditBtn" onclick="cancelEdit('pvt')">Cancel</button> <button class="btn btn-o btn-sm" onclick="saveQuotationDraftShortcut('pvt')" title="Save Draft (Ctrl + S)">💾 Save Draft</button> <button class="btn btn-o btn-sm" onclick="pPreview()" title="Print Preview (Ctrl + P)">Preview</button> <button class="btn btn-sm" style="background:#25D366;color:#fff" onclick="shareWhatsAppPvt()">📱 WhatsApp</button> <button class="btn btn-sm" style="background:#7c3aed;color:#fff" onclick="printCostingPvt()">🖨 Print Costing</button> <button class="btn btn-a btn-sm" id="pSaveBtn" onclick="pSave()" title="Save & Print (Ctrl + Enter)">Save & Print</button></div></div>
 <div class="g4"><div class="fg"><label>Client Name</label><input id="pN"></div><div class="fg"><label>Contact</label><input id="pPh"></div><div class="fg"><label>Travel Dates</label><input id="pDt"></div><div class="fg"><label>Default ROE</label><input type="number" id="pROE" value="${roeDef}" oninput="triggerCalc()"></div><div class="fg gf"><label>PKG Includes</label><input id="pInc" value="FLIGHT, HOTEL, VISA, TRANSPORT"></div></div></div>
-<div class="tabs" id="pTabs"><div class="tab on" onclick="pTab('A')">Option A</div><div class="tab" onclick="pTab('B')">Option B</div><div class="tab" onclick="pTab('C')">Option C</div></div><div id="pTP"></div>`;
+<div class="tabs" id="pTabs" style="display:flex;align-items:center;gap:6px"><div class="tab on" id="pTabBtnA" onclick="pTab('A')">Option A</div><div class="tab" id="pTabBtnB" style="display:none" onclick="pTab('B')">Option B <span class="del-opt-btn" onclick="event.stopPropagation();removeOpt('B')" title="Remove Option B">✕</span></div><div class="tab" id="pTabBtnC" style="display:none" onclick="pTab('C')">Option C <span class="del-opt-btn" onclick="event.stopPropagation();removeOpt('C')" title="Remove Option C">✕</span></div><button type="button" class="btn btn-o btn-sm" id="pAddOptBtn" onclick="addNextOpt()" style="padding:4px 10px;font-size:.74rem">+ Add Option</button></div><div id="pTP"></div>`;
 ['A','B','C'].forEach(l=>bOpt(l));pTab('A');attachAutoCalc();_syncTravelDatesFromFlights();checkDraftBanner('pvt')}
+
+window.addNextOpt=function(){
+  const tabB=$("pTabBtnB"),tabC=$("pTabBtnC");
+  if(tabB&&tabB.style.display==="none"){
+    tabB.style.display="";
+    pTab('B');
+  }else if(tabC&&tabC.style.display==="none"){
+    tabC.style.display="";
+    pTab('C');
+    if($("pAddOptBtn"))$("pAddOptBtn").style.display="none";
+  }
+};
+
+window.removeOpt=function(L){
+  confirmModal(`Remove Option ${L}? Data in this option will be cleared.`,()=>{
+    const tabBtn=$(`pTabBtn${L}`);
+    if(tabBtn)tabBtn.style.display="none";
+    bOptReset(L);
+    if($("pAddOptBtn"))$("pAddOptBtn").style.display="";
+    pTab('A');
+    triggerCalc();
+    toast(`Option ${L} removed`);
+  });
+};
+
+function bOptReset(L){
+  for(let i=0;i<6;i++){
+    if($(`fA${L}${i}`)) $(`fA${L}${i}`).selectedIndex=0;
+    if($(`fD${L}${i}`)) $(`fD${L}${i}`).value="";
+    if($(`fS${L}${i}`)) $(`fS${L}${i}`).value="";
+    if($(`h${L}${i}`)) $(`h${L}${i}`).value="";
+    if($(`hRt${L}${i}`)) $(`hRt${L}${i}`).value="";
+    if($(`tS${L}${i}`)) $(`tS${L}${i}`).value="";
+    if($(`tR${L}${i}`)) $(`tR${L}${i}`).value="";
+  }
+  if($(`tk${L}`)) $(`tk${L}`).value="";
+  if($(`cP${L}`)) $(`cP${L}`).value="0";
+  if($(`iP${L}`)) $(`iP${L}`).value="0";
+  const mvBody=$(`mvBody${L}`),cmvBody=$(`cmvBody${L}`),imvBody=$(`imvBody${L}`);
+  if(mvBody)mvBody.innerHTML="";if(cmvBody)cmvBody.innerHTML="";if(imvBody)imvBody.innerHTML="";
+}
 
 /* ===== AUTO-TRAVEL DATES FROM FLIGHT DATES =====
    Jab user flight dates enter kare, travel dates field automatically fill ho
@@ -3687,7 +3735,8 @@ const isEdit=!!editKey&&!!existing&&existing.type==="private"&&(P("allquot","edi
 if(!isEdit&&!P("quot","add")){toast("You don't have permission to create quotations","err");return}
 const invNo=isEdit?existing.invoiceNo:await nextInvoiceNo();
 const _myBr=myBranchForSave();
-const data={type:"private",clientName:$("pN")?.value||"",contactNo:$("pPh")?.value||"",pkgIncludes:$("pInc")?.value||"",travelDates:$("pDt")?.value||"",createdBy:existing?existing.createdBy:S.user.u,createdAt:existing?existing.createdAt:new Date().toISOString(),updatedBy:S.user.u,updatedAt:new Date().toISOString(),invoiceNo:invNo,branchId:isEdit?(existing.branchId||_myBr.id):_myBr.id,branchName:isEdit?(existing.branchName||_myBr.name):_myBr.name,options:{}};
+const isIntlVal=Boolean($("pIsIntl")?.checked);
+const data={type:"private",clientName:$("pN")?.value||"",contactNo:$("pPh")?.value||"",pkgIncludes:$("pInc")?.value||"",travelDates:$("pDt")?.value||"",createdBy:existing?existing.createdBy:S.user.u,createdAt:existing?existing.createdAt:new Date().toISOString(),updatedBy:S.user.u,updatedAt:new Date().toISOString(),invoiceNo:invNo,branchId:isEdit?(existing.branchId||_myBr.id):_myBr.id,branchName:isEdit?(existing.branchName||_myBr.name):_myBr.name,isIntl:isIntlVal,isInternational:isIntlVal,options:{}};
 ['A','B','C'].forEach(L=>{if(!$(`aP${L}`))return;const o={flights:[],adultPax:n($(`aP${L}`)?.value),adultCat:$(`aCt${L}`)?.value||"",days:n($(`dDy${L}`)?.value),hotels:[],visa:{},transports:[],ticketPKR:n($(`tk${L}`)?.value),ticketQty:n($(`tkQ${L}`)?.value),markup:n($(`mk${L}`)?.value),totalAdult:0,perAdult:0,childPax:n($(`cP${L}`)?.value),childVisa:{r:n($(`cvR${L}`)?.value),q:n($(`cvQ${L}`)?.value),roe:n($(`cvE${L}`)?.value)},childTicket:{pkr:n($(`ctk${L}`)?.value),q:n($(`ctkQ${L}`)?.value)},childTransport:{veh:$(`cTrV${L}`)?.value||"AUTO",rate:n($(`cTrR${L}`)?.value),qty:n($(`cTrQ${L}`)?.value),roe:n($(`cTrE${L}`)?.value)},childHotels:[],childMarkup:n($(`cMk${L}`)?.value),totalChild:0,perChild:0,infantPax:n($(`iP${L}`)?.value),infantVisa:{r:n($(`ivR${L}`)?.value),q:n($(`ivQ${L}`)?.value),roe:n($(`ivE${L}`)?.value)},infantTicket:{pkr:n($(`itk${L}`)?.value),q:n($(`itkQ${L}`)?.value)},infantMarkup:n($(`iMk${L}`)?.value),totalInfant:0,perInfant:0};
 for(let i=0;i<6;i++)o.flights.push({airline:$(`fA${L}${i}`)?.value||"",cls:$(`fC${L}${i}`)?.value||"",lug:$(`fL${L}${i}`)?.value||"",date:$(`fD${L}${i}`)?.value||"",sec:$(`fS${L}${i}`)?.value||"",dep:$(`fDp${L}${i}`)?.value||"",arr:$(`fAr${L}${i}`)?.value||"",lay:$(`fLy${L}${i}`)?.value||"",sec2:$(`fS2${L}${i}`)?.value||"",dep2:$(`fD2${L}${i}`)?.value||"",arr2:$(`fA2${L}${i}`)?.value||""});
 for(let i=0;i<6;i++){const hName=$(`h${L}${i}`)?.value||"",hCityV=$(`hCity${L}${i}`)?.value||"makkah";o.hotels.push({name:hName,type:$(`hR${L}${i}`)?.value||"",city:hCityV,rate:n($(`hRt${L}${i}`)?.value),qty:n($(`hQ${L}${i}`)?.value),dist:$(`hD${L}${i}`)?.value||"",ngt:n($(`hN${L}${i}`)?.value),roe:n($(`hE${L}${i}`)?.value),loc:hotelLoc(hCityV,hName),img:hotelImg(hCityV,hName)})}for(let i=0;i<6;i++){const cName=$(`cH${L}${i}`)?.value||"",cCityV=$(`cHCity${L}${i}`)?.value||"makkah";o.childHotels.push({name:cName,type:$(`cHR${L}${i}`)?.value||"",city:cCityV,rate:n($(`cHRt${L}${i}`)?.value),qty:n($(`cHQ${L}${i}`)?.value),dist:$(`cHD${L}${i}`)?.value||"",ngt:n($(`cHN${L}${i}`)?.value),roe:n($(`cHE${L}${i}`)?.value),loc:hotelLoc(cCityV,cName),img:hotelImg(cCityV,cName)})}
@@ -3731,7 +3780,8 @@ window.pPreview=()=>{
 if(!$("pN")?.value.trim()){toast("Enter client name","warn");return}
 pCalc(true);
 const existingNo=editKey&&S.quotations[editKey]?S.quotations[editKey].invoiceNo:"DRAFT";
-const data={type:"private",clientName:$("pN")?.value||"",contactNo:$("pPh")?.value||"",pkgIncludes:$("pInc")?.value||"",travelDates:$("pDt")?.value||"",createdBy:S.user.u,createdAt:new Date().toISOString(),invoiceNo:existingNo,options:{}};
+const isIntlVal=Boolean($("pIsIntl")?.checked);
+const data={type:"private",clientName:$("pN")?.value||"",contactNo:$("pPh")?.value||"",pkgIncludes:$("pInc")?.value||"",travelDates:$("pDt")?.value||"",createdBy:S.user.u,createdAt:new Date().toISOString(),invoiceNo:existingNo,isIntl:isIntlVal,isInternational:isIntlVal,options:{}};
 ['A','B','C'].forEach(L=>{if(!$(`aP${L}`))return;const o={flights:[],adultPax:n($(`aP${L}`)?.value),adultCat:$(`aCt${L}`)?.value||"",days:n($(`dDy${L}`)?.value),hotels:[],visa:{},transports:[],ticketPKR:n($(`tk${L}`)?.value),ticketQty:n($(`tkQ${L}`)?.value),markup:n($(`mk${L}`)?.value),totalAdult:0,perAdult:0,childPax:n($(`cP${L}`)?.value),childVisa:{r:n($(`cvR${L}`)?.value),q:n($(`cvQ${L}`)?.value),roe:n($(`cvE${L}`)?.value)},childTicket:{pkr:n($(`ctk${L}`)?.value),q:n($(`ctkQ${L}`)?.value)},childTransport:{veh:$(`cTrV${L}`)?.value||"AUTO",rate:n($(`cTrR${L}`)?.value),qty:n($(`cTrQ${L}`)?.value),roe:n($(`cTrE${L}`)?.value)},childHotels:[],childMarkup:n($(`cMk${L}`)?.value),totalChild:0,perChild:0,infantPax:n($(`iP${L}`)?.value),infantVisa:{r:n($(`ivR${L}`)?.value),q:n($(`ivQ${L}`)?.value),roe:n($(`ivE${L}`)?.value)},infantTicket:{pkr:n($(`itk${L}`)?.value),q:n($(`itkQ${L}`)?.value)},infantMarkup:n($(`iMk${L}`)?.value),totalInfant:0,perInfant:0};
 for(let i=0;i<6;i++)o.flights.push({airline:$(`fA${L}${i}`)?.value||"",cls:$(`fC${L}${i}`)?.value||"",lug:$(`fL${L}${i}`)?.value||"",date:$(`fD${L}${i}`)?.value||"",sec:$(`fS${L}${i}`)?.value||"",dep:$(`fDp${L}${i}`)?.value||"",arr:$(`fAr${L}${i}`)?.value||"",lay:$(`fLy${L}${i}`)?.value||"",sec2:$(`fS2${L}${i}`)?.value||"",dep2:$(`fD2${L}${i}`)?.value||"",arr2:$(`fA2${L}${i}`)?.value||""});
 for(let i=0;i<6;i++){const hName=$(`h${L}${i}`)?.value||"",hCityV=$(`hCity${L}${i}`)?.value||"makkah";o.hotels.push({name:hName,type:$(`hR${L}${i}`)?.value||"",city:hCityV,rate:n($(`hRt${L}${i}`)?.value),qty:n($(`hQ${L}${i}`)?.value),dist:$(`hD${L}${i}`)?.value||"",ngt:n($(`hN${L}${i}`)?.value),roe:n($(`hE${L}${i}`)?.value),loc:hotelLoc(hCityV,hName),img:hotelImg(hCityV,hName)})}for(let i=0;i<6;i++){const cName=$(`cH${L}${i}`)?.value||"",cCityV=$(`cHCity${L}${i}`)?.value||"makkah";o.childHotels.push({name:cName,type:$(`cHR${L}${i}`)?.value||"",city:cCityV,rate:n($(`cHRt${L}${i}`)?.value),qty:n($(`cHQ${L}${i}`)?.value),dist:$(`cHD${L}${i}`)?.value||"",ngt:n($(`cHN${L}${i}`)?.value),roe:n($(`cHE${L}${i}`)?.value),loc:hotelLoc(cCityV,cName),img:hotelImg(cCityV,cName)})}
@@ -4062,6 +4112,13 @@ fillIf(`iP${L}`,o.infantPax);
 if(o.infantVisa){fillIf(`ivR${L}`,o.infantVisa.r);setManual(`ivQ${L}`,o.infantVisa.q);fillIf(`ivE${L}`,o.infantVisa.roe)}
 if(o.infantTicket){fillIf(`itk${L}`,o.infantTicket.pkr);setManual(`itkQ${L}`,o.infantTicket.q)}
 fillIf(`iMk${L}`,o.infantMarkup)});
+if(data.isIntl||data.isInternational){const chk=$("pIsIntl");if(chk)chk.checked=true}else{const chk=$("pIsIntl");if(chk)chk.checked=false}
+const hasB=Boolean(data.options?.B&&_optHasRealData(data.options.B));
+const hasC=Boolean(data.options?.C&&_optHasRealData(data.options.C));
+const tabB=$("pTabBtnB"),tabC=$("pTabBtnC"),addBtn=$("pAddOptBtn");
+if(tabB)tabB.style.display=hasB?"":"none";
+if(tabC)tabC.style.display=hasC?"":"none";
+if(addBtn)addBtn.style.display=(hasB&&hasC)?"none":"";
 pCalc(true);pTab('A');
 const tag=$("pEditTag");if(tag)tag.innerHTML=`<span class="bd bd-a" style="margin-left:8px">Editing ${data.invoiceNo||""}</span>`;
 const cb=$("pCancelEditBtn");if(cb)cb.style.display="";
@@ -4413,7 +4470,11 @@ function printPvtDirect(d,s,selectedLabels){
   const vo=selectedLabels?opts.filter(([l])=>selectedLabels.includes(l)):_filterPrintOpts(opts);
   if(!vo.length){toast("No data to print","warn");return}
   const logo=s.logo?`<div class="logo-wrap"><img src="${s.logo}"></div>`:`<div class="logo-fb">${(s.company||"P")[0]}</div>`;
-  const fn=formatPdfFilename(d.clientName,"Customized_Umrah",d.invoiceNo);
+  const isIntl=Boolean(d.isIntl||d.isInternational);
+  const pkgTypeLabel=isIntl?"International Package":"Customized Umrah";
+  const mainTitleText=isIntl?"INTERNATIONAL PACKAGE COSTING":"CUSTOMIZED UMRAH PACKAGE";
+  const optTitleText=l=>isIntl?`INTERNATIONAL PACKAGE — OPTION ${l}`:`CUSTOMIZED UMRAH PACKAGE — OPTION ${l}`;
+  const fn=formatPdfFilename(d.clientName,isIntl?"International_Package":"Customized_Umrah",d.invoiceNo);
 
   /* ---- Client info block: built PER OPTION using that option's pax data ---- */
   const makeCinfoHtml=(o)=>{
@@ -4453,7 +4514,7 @@ function printPvtDirect(d,s,selectedLabels){
     if(o.childPax>0)body+=`<div class="sum-row"><span>Child Per Pax:</span><b style="color:#c2410c!important">PKR ${fmt(o.perChild)}</b></div>`;
     if(o.infantPax>0)body+=`<div class="sum-row inf"><span>Infant Per Pax:</span><b>PKR ${fmt(o.perInfant)}</b></div>`;
     body+=`</div></div>`;
-    const html=`<div class="pp pp-single" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}${ppHeader(s,logo)}<div class="title">CUSTOMIZED UMRAH PACKAGE</div>${ppIcards(d,"Customized Umrah")}${makeCinfoHtml(o)}<div class="pp-body">${body}</div>${ppFooter(s)}</div>${instrPageHtml}`;
+    const html=`<div class="pp pp-single" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}${ppHeader(s,logo)}<div class="title">${mainTitleText}</div>${ppIcards(d,pkgTypeLabel)}${makeCinfoHtml(o)}<div class="pp-body">${body}</div>${ppFooter(s)}</div>${instrPageHtml}`;
     openPrintPreview(html,fn,{kind:"pvt",d,s});
   }else{
     /* Multiple options:
@@ -4477,7 +4538,7 @@ function printPvtDirect(d,s,selectedLabels){
       if(o.infantPax>0)body+=`<div class="sum-row inf"><span>Infant Per Pax:</span><b>PKR ${fmt(o.perInfant)}</b></div>`;
       body+=`</div></div>`;
       /* Full header + FULL client details on EVERY option page */
-      const topBlock=`${ppHeader(s,logo)}<div class="title">CUSTOMIZED UMRAH PACKAGE — OPTION ${l}</div>${ppIcards(d,"Customized Umrah")}${makeCinfoHtml(o)}`;
+      const topBlock=`${ppHeader(s,logo)}<div class="title">${optTitleText(l)}</div>${ppIcards(d,pkgTypeLabel)}${makeCinfoHtml(o)}`;
       pagesHtml+=`<div class="pp" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}${topBlock}<div class="pp-body">${body}</div>${ppFooter(s)}</div>`;
     });
     /* Instructions: sirf ek baar sab options ke baad */
@@ -4566,7 +4627,10 @@ function parseHotelDistance(d){
 }
 
 function inferHotelStars(h){
-  if(h.stars && typeof h.stars === 'number' && h.stars >= 1 && h.stars <= 5) return h.stars;
+  if(h.stars !== undefined && h.stars !== null && h.stars !== ""){
+    const st = parseInt(h.stars, 10);
+    if(!isNaN(st) && st >= 1 && st <= 5) return st;
+  }
   const name = (h.n||"").toUpperCase();
   if(name.includes("FAIRMONT") || name.includes("CLOCK ROYAL") || name.includes("RAFFLES") || name.includes("PULLMAN") || name.includes("SWISSOTEL") || name.includes("MOVENPICK") || name.includes("OBERAI") || name.includes("INTERCONTINENTAL") || name.includes("HILTON") || name.includes("DAR AL TAQWA") || name.includes("DAR AL IMAN") || name.includes("SHERATON") || name.includes("CONRAD") || name.includes("ANJUM") || name.includes("MARRIOTT") || name.includes("SOFITEL")) return 5;
   if(name.includes("GRAND") || name.includes("ROTANA") || name.includes("AL SAFWA") || name.includes("LE MERIDIEN") || name.includes("ROYAL") || name.includes("MAWADDAH") || name.includes("MILLENNIUM") || name.includes("RADISSON") || name.includes("FRONTEL") || name.includes("TAIBA") || name.includes("SHAZA") || name.includes("TOWERS") || name.includes("VOUCO") || name.includes("AL KISWAH")) return 4;
@@ -5409,40 +5473,180 @@ window.eH=(c,i)=>{
 };
 
 window.dH=async(c,i)=>{if(!P("htl","delete"))return toast("Not allowed","err");confirmModal("Delete this hotel? (Stays in Recycle Bin for 7 days)",async()=>{const h=S.hotels[c][i];const removed=S.hotels[c].splice(i,1)[0];await _trashAdd("hotel",(removed&&removed.n)||"Hotel",(S.cities.find(x=>x.key===c)||{}).label||c,h&&h.id?("hotels/"+c+"/"+h.id):"",removed,{city:c});try{if(h&&h.id)await bFD("hotels/"+c+"/"+h.id);else await _safeArrWrite("hotels/"+c,S.hotels[c],a=>a.filter(x=>x&&x.id!==(removed&&removed.id)));toast("Deleted");pgHtl($("CT").firstChild)}catch(e){toast("Delete failed: "+e.message,"err");S.hotels[c].splice(i,0,removed)}});};
-function parseHotelImport(raw,defaultCityKey){const lines=raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);const buckets={};let count=0;
-lines.forEach(line=>{const cols=line.includes("\t")?line.split("\t"):line.split(",");const parts=cols.map(x=>x.trim());if(!parts.length)return;let name="",dist="",city="",loc="";
-if(parts.length>=5&&/^\d+$/.test(parts[0])){name=parts[1];dist=parts[2];city=parts[3];loc=parts[4]}
-else if(parts.length>=4&&/^\d+$/.test(parts[0])){name=parts[1];dist=parts[2];city=parts[3]}
-else if(parts.length===3&&/^\d+$/.test(parts[0])){name=parts[1];dist=parts[2];city=defaultCityKey}
-else if(parts.length>=4){name=parts[0];dist=parts[1];city=parts[2];loc=parts[3]}
-else if(parts.length===3){name=parts[0];dist=parts[1];city=parts[2]}
-else if(parts.length===2){name=parts[0];dist=parts[1];city=defaultCityKey}
-else if(parts.length===1){name=parts[0];dist="";city=defaultCityKey}
-name=(name||"").trim();if(!name)return;dist=(dist||"").trim();city=(city||defaultCityKey||"makkah").trim();loc=(loc||"").trim();
-const norm=normalizeCityKey(city);const existing=S.cities.find(c=>c.key===norm||c.label.toLowerCase()===city.toLowerCase());
-const cityKey=existing?existing.key:norm,cityLbl=existing?existing.label:city;
-if(!buckets[cityKey])buckets[cityKey]={label:cityLbl,items:[]};
-buckets[cityKey].items.push({n:name.toUpperCase(),d:dist,loc});count++});
-return{buckets,count}}
-async function applyHotelImport(result){const{buckets}=result;let citiesChanged=false;
-await Promise.all(Object.keys(buckets).map(key=>ensureHotelsLoaded(key)));
-const saves=[];
-const dupes=[]; /* same naam ke hotels — skip nahi, Duplicate Review mein jayenge */
-for(const key in buckets){if(!S.cities.some(c=>c.key===key)){S.cities.push({key,label:buckets[key].label});citiesChanged=true}
-if(!S.hotels[key])S.hotels[key]=[];
-const cityUpdates={};
-buckets[key].items.forEach(item=>{const ex=S.hotels[key].find(h=>h.n===item.n);if(!ex){const id=_newHotelId();const withId={...item,id};S.hotels[key].push(withId);cityUpdates[id]=withId}else{dupes.push({city:key,cityLabel:(S.cities.find(x=>x.key===key)||{label:key}).label,keep:ex,dupe:{n:item.n,d:item.d||"",loc:item.loc||"",img:""}})}});
-if(Object.keys(cityUpdates).length)saves.push(bFU_Long("hotels/"+key,cityUpdates));
+function parseHotelImport(raw,defaultCityKey){
+  const lines=raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  if(!lines.length)return{buckets:{},count:0};
+  const buckets={};let count=0;
+
+  function splitRow(row){
+    if(row.includes("\t")) return row.split("\t").map(x=>x.replace(/^["']|["']$/g,"").trim());
+    const res=[];let cur="",inQuotes=false;
+    for(let i=0;i<row.length;i++){
+      const ch=row[i];
+      if(ch==='"'||ch==="'"){inQuotes=!inQuotes}
+      else if(ch===','&&!inQuotes){res.push(cur.trim());cur=""}
+      else cur+=ch;
+    }
+    res.push(cur.trim());
+    return res.map(x=>x.replace(/^["']|["']$/g,"").trim());
+  }
+
+  // 1. Header Row Column Mapping Check
+  let colMap=null;
+  const firstRowParts=splitRow(lines[0]);
+  const firstRowStr=firstRowParts.join(" ").toLowerCase();
+  const isHeader=firstRowStr.includes("hotel")||firstRowStr.includes("distance")||firstRowStr.includes("dist")||firstRowStr.includes("city")||firstRowStr.includes("location")||firstRowStr.includes("map")||firstRowStr.includes("sr no")||firstRowStr.includes("s.no")||firstRowStr.includes("sno");
+
+  let startIdx=0;
+  if(isHeader&&lines.length>1){
+    startIdx=1;
+    colMap={name:-1,dist:-1,city:-1,loc:-1,stars:-1,sno:-1};
+    firstRowParts.forEach((header,idx)=>{
+      const h=header.toLowerCase();
+      if(h.includes("s.no")||h.includes("sr")||h.includes("sno")||h==="#"||h==="no"||h==="id"){colMap.sno=idx}
+      else if(h.includes("hotel")||h.includes("name")||h.includes("property")){colMap.name=idx}
+      else if(h.includes("dist")||h.includes("meter")||h.includes("metre")||h.includes("km")||h.includes("haram")){colMap.dist=idx}
+      else if(h.includes("city")||h.includes("destination")){colMap.city=idx}
+      else if(h.includes("map")||h.includes("loc")||h.includes("link")||h.includes("url")||h.includes("gps")){colMap.loc=idx}
+      else if(h.includes("star")||h.includes("rating")||h.includes("cat")){colMap.stars=idx}
+    });
+  }
+
+  for(let lineIdx=startIdx;lineIdx<lines.length;lineIdx++){
+    const line=lines[lineIdx];
+    const parts=splitRow(line);
+    if(!parts.length||!parts.some(Boolean))continue;
+
+    let name="",dist="",city="",loc="",stars=null;
+
+    if(colMap&&colMap.name!==-1){
+      if(colMap.name!==-1&&parts[colMap.name]) name=parts[colMap.name];
+      if(colMap.dist!==-1&&parts[colMap.dist]) dist=parts[colMap.dist];
+      if(colMap.city!==-1&&parts[colMap.city]) city=parts[colMap.city];
+      if(colMap.loc!==-1&&parts[colMap.loc]) loc=parts[colMap.loc];
+      if(colMap.stars!==-1&&parts[colMap.stars]){
+        const sm=String(parts[colMap.stars]).match(/\d/);
+        if(sm) stars=parseInt(sm[0],10);
+      }
+    }else{
+      let cells=[...parts];
+      if(cells.length>1&&/^\d+$/.test(cells[0])&&!cells[0].toLowerCase().includes("hotel")){
+        cells.shift(); // Remove serial number
+      }
+
+      const remaining=[];
+      cells.forEach(cell=>{
+        if(!cell)return;
+        const clow=cell.toLowerCase().trim();
+
+        // Location / Maps URL
+        if(clow.startsWith("http://")||clow.startsWith("https://")||clow.startsWith("maps.")||clow.includes("goo.gl")||clow.includes("google.com/maps")){
+          if(!loc){loc=cell;return}
+        }
+        // City match
+        const matchedCity=S.cities?.find(c=>c.key===clow||c.label.toLowerCase()===clow||(clow.includes("makkah")||clow.includes("mecca")||clow.includes("madin")));
+        if(matchedCity&&!city){city=matchedCity.key;return}
+        // Distance match
+        if(/^(\d+\s*-\s*\d+\s*m|\d+\s*m|\d+\s*km|\d+\s*meters?|shuttle|walking|walk|0m|0\s*meter)$/i.test(cell)&&!dist){
+          dist=cell;return;
+        }
+        // Star match
+        if(/^([1-5]\s*stars?|[1-5]\s*★|[1-5]\*)$/i.test(cell)&&!stars){
+          stars=parseInt(cell.match(/\d/)[0],10);return;
+        }
+        remaining.push(cell);
+      });
+
+      if(remaining.length>0) name=remaining[0];
+      if(!dist&&remaining.length>1) dist=remaining[1];
+      if(!city&&remaining.length>2) city=remaining[2];
+      if(!loc&&remaining.length>3) loc=remaining[3];
+    }
+
+    name=(name||"").trim();
+    if(!name)continue;
+
+    dist=(dist||"").trim();
+    if(/^\d+$/.test(dist)) dist=dist+"m"; // Auto-format 500 -> 500m
+
+    city=(city||defaultCityKey||"makkah").trim();
+    loc=(loc||"").trim();
+
+    const norm=normalizeCityKey(city);
+    const existing=S.cities.find(c=>c.key===norm||c.label.toLowerCase()===city.toLowerCase());
+    const cityKey=existing?existing.key:norm,cityLbl=existing?existing.label:city;
+
+    if(!buckets[cityKey])buckets[cityKey]={label:cityLbl,items:[]};
+    const hotelObj={n:name.toUpperCase(),d:dist,loc};
+    if(stars) hotelObj.stars=stars;
+    buckets[cityKey].items.push(hotelObj);
+    count++;
+  }
+
+  return{buckets,count};
 }
-if(citiesChanged){try{const raw=await FR("cities");if(Array.isArray(raw)&&raw.length)raw.forEach(c=>{if(c&&!S.cities.some(x=>x&&x.key===c.key))S.cities.push(c)})}catch(e){}saves.push(bFS("cities",S.cities))}
-await Promise.all(saves);
-if(dupes.length){toast(dupes.length+" duplicate hotel(s) found — choose Merge or Skip","warn");_openDupesReview(dupes,"import")}}
-window.impFileChange=()=>{const f=$("impFile")?.files?.[0];if(!f)return;const reader=new FileReader();
-reader.onload=async e=>{try{
-if(f.name.toLowerCase().endsWith(".csv")){$("impData").value=e.target.result}
-else{await loadXlsx();if(window.XLSX){const wb=XLSX.read(e.target.result,{type:"binary"});const ws=wb.Sheets[wb.SheetNames[0]];$("impData").value=XLSX.utils.sheet_to_csv(ws)}else{toast("Excel reader failed, save as CSV","err")}}
-}catch(ex){toast("Could not read file: "+ex.message,"err")}};
-if(f.name.toLowerCase().endsWith(".csv"))reader.readAsText(f);else reader.readAsBinaryString(f)};
+
+async function applyHotelImport(result){
+  const{buckets}=result;let citiesChanged=false;
+  await Promise.all(Object.keys(buckets).map(key=>ensureHotelsLoaded(key)));
+  const saves=[];
+  const dupes=[];
+  for(const key in buckets){
+    if(!S.cities.some(c=>c.key===key)){S.cities.push({key,label:buckets[key].label});citiesChanged=true}
+    if(!S.hotels[key])S.hotels[key]=[];
+    const cityUpdates={};
+    buckets[key].items.forEach(item=>{
+      const ex=S.hotels[key].find(h=>h.n===item.n);
+      if(!ex){
+        const id=_newHotelId();
+        const withId={...item,id};
+        S.hotels[key].push(withId);
+        cityUpdates[id]=withId;
+      }else{
+        dupes.push({city:key,cityLabel:(S.cities.find(x=>x.key===key)||{label:key}).label,keep:ex,dupe:{n:item.n,d:item.d||"",loc:item.loc||"",img:""}});
+      }
+    });
+    // Chunk writes into batches of 50 to avoid network/Supabase payload timeouts
+    const ids=Object.keys(cityUpdates);
+    if(ids.length){
+      for(let i=0;i<ids.length;i+=50){
+        const chunkIds=ids.slice(i,i+50);
+        const chunkObj={};
+        chunkIds.forEach(id=>{chunkObj[id]=cityUpdates[id]});
+        saves.push(bFU_Long("hotels/"+key,chunkObj));
+      }
+    }
+  }
+  if(citiesChanged){saves.push(bFS("cities",S.cities))}
+  await Promise.all(saves);
+  if(dupes.length){toast(dupes.length+" duplicate hotel(s) found — choose Merge or Skip","warn");_openDupesReview(dupes,"import")}
+}
+
+window.impFileChange=()=>{
+  const f=$("impFile")?.files?.[0];
+  if(!f)return;
+  const reader=new FileReader();
+  reader.onload=async e=>{
+    try{
+      if(f.name.toLowerCase().endsWith(".csv")){
+        $("impData").value=e.target.result;
+      }else{
+        await loadXlsx();
+        if(window.XLSX){
+          const data=new Uint8Array(e.target.result);
+          const wb=XLSX.read(data,{type:"array"});
+          const ws=wb.Sheets[wb.SheetNames[0]];
+          const tsv=XLSX.utils.sheet_to_csv(ws,{FS:"\t",RS:"\n"});
+          $("impData").value=tsv;
+        }else{
+          toast("Excel reader failed, please save as CSV","err");
+        }
+      }
+    }catch(ex){toast("Could not read file: "+ex.message,"err")}
+  };
+  if(f.name.toLowerCase().endsWith(".csv")) reader.readAsText(f);
+  else reader.readAsArrayBuffer(f);
+};
 window.openImportHotels=()=>{if(!P("htl","add"))return toast("Not allowed","err");showModal("Import Hotels",`<div class="fg"><label>Upload Excel/CSV File (optional)</label><input type="file" id="impFile" accept=".csv,.xlsx,.xls" onchange="impFileChange()"></div><div class="fg"><label>Default City (used only if a row has no city column)</label><select id="impCity">${cityOptionsHtml("makkah")}</select></div><div class="fg"><label>Paste Data — one hotel per line</label><textarea id="impData" rows="8" placeholder="1&#9;Makkah Tower&#9;0m&#9;Makkah&#9;https://maps.app.goo.gl/xxxx"></textarea></div><div style="font-size:.72rem;color:var(--t2)">Columns: S.No, Hotel Name, Distance, City, Location (Google Maps link) — upload a file above or paste directly from Excel (tab-separated)/comma-separated. S.No, City and Location are optional; new cities are created automatically. Duplicate hotels with the same name appear in <b>Duplicate Review</b> where you can choose to <b>Merge</b> or <b>Skip</b> them.</div>`,()=>{const raw=$("impData").value,defCity=$("impCity").value;if(!raw.trim())return toast("Paste or upload some data","err")||false;const result=parseHotelImport(raw,defCity);if(!result.count)return toast("No valid rows found","err")||false;applyHotelImport(result).then(()=>{toast(`Imported ${result.count} hotel(s)`);rH()}).catch(e=>toast("Import failed: "+e.message,"err"));return true})};
 
 function pgTrn(pg){const canAdd=P("trn","add");pg.innerHTML=`<div class="cd"><div class="cd-h">Transport ${canAdd?`<button class="btn btn-sm btn-p" onclick="addTr()">+ Add</button>`:""}</div><div class="tw"><table><thead><tr><th>Sector</th><th>SEDAN</th><th>H1</th><th>STARIA</th><th>GMC</th><th>HIACE</th><th>COASTER</th><th>BUS</th>${(P("trn","edit")||P("trn","delete"))?`<th style="width:80px"></th>`:""}</tr></thead><tbody id="tL"></tbody></table></div></div>`;rT()}
@@ -6296,16 +6500,16 @@ document.addEventListener("visibilitychange",async()=>{
     autoSaveDraftNow();
   }else if(document.visibilityState==="visible"){
     const away=Date.now()-_lastVisibleTs;
-    if(away>30000){
+    if(away>120000){ // 2 minutes away
       try{
+        const isEditing = Boolean(editKey || document.querySelector(".modal") || document.activeElement?.tagName === "INPUT" || document.activeElement?.tagName === "TEXTAREA");
         await loadData();
         await loadBranchesAndApply();
         applySidebarBranding();
         buildSB();
-        if(curPage!=="pvt"&&curPage!=="grp"){
+        if(!isEditing && curPage!=="pvt" && curPage!=="grp"){
           nav(curPage);
         }
-        toast("Auto-refreshed ✓");
       }catch(e){}
     }
   }
