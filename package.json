@@ -1,0 +1,15 @@
+{
+  "name": "pak-globe-umrah-costing",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "mkdir -p dist && cp -r index.html styles.css app.js utils.js d3.min.js favicon.png assets dist/ 2>/dev/null || true",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "d3": "^7.9.0",
+    "express": "^4.21.2"
+  }
+}

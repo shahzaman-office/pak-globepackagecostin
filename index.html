@@ -115,6 +115,7 @@
 <span class="tt" id="PT">Dashboard</span>
 <div class="gsearch-wrap"><input id="gSearch" class="gsearch-input" placeholder="Search quotations, hotels..." autocomplete="off"><div id="gSearchResults" class="gsearch-results"></div></div>
 <button id="rfB" onclick="refreshAll()" title="Refresh data">🔄</button>
+<button id="kbB" onclick="showKeyboardShortcutsModal()" title="Keyboard Shortcuts (Ctrl + / or ?)" aria-label="Keyboard Shortcuts">⌨️</button>
 <button id="thB" onclick="toggleTheme()">🌙</button>
 <div class="usr"><span class="un" id="TU">-</span><span class="bd bd-a" id="TR">admin</span><button class="btn btn-sm btn-o" onclick="doLogout()">Logout</button></div>
 </header>
@@ -126,6 +127,7 @@
 <div id="printBar">
 <h3 style="white-space:nowrap">🖨 Print Preview</h3>
 <div class="pbtns">
+<button id="wmToggleBtn" style="background:#0284c7;color:#fff" onclick="togglePrintWatermark()" title="Toggle Background Watermark overlay on/off">💧 Watermark: ON</button>
 <button style="background:#25D366;color:#fff" onclick="shareWhatsAppCurrentPrint()" title="Share quotation text directly to WhatsApp">📱 Send to WhatsApp</button>
 <button style="background:#7c3aed;color:#fff" onclick="loadPdfLibs().then(downloadPdfNow)" title="Download PDF — pixel-perfect, same as preview">⬇ Download PDF</button>
 <button style="background:#10b981;color:#fff" onclick="doPrintNow()" title="Print / Save as PDF via browser">🖨 Print / Save PDF</button>
@@ -138,6 +140,7 @@
 <div id="PA"></div>
 <div id="MD"></div>
 
+<script src="d3.min.js"></script>
 <script src="utils.js"></script>
 <script src="app.js"></script>
 </body>

@@ -1,0 +1,6 @@
+{
+  "name": "Pak-Globe Umrah Costing",
+  "description": "Professional Umrah package costing and quotation management platform for hotel, transport, and visa calculation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

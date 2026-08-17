@@ -1,20 +1,124 @@
-/* ===== SUPABASE BACKEND (Firebase Realtime DB ki jagah) =====
-   Sara data Supabase Postgres mein aik hi "app_data" table mein jsonb tree
-   ki shakal mein rehta hai (users, settings, hotels, transport, quotations,
-   lists, cities, branches). Path-based reads/writes (jo pehle Firebase mein
-   "hotels/makkah" style hotay thay) ab Postgres RPC functions se hotay hain.
-   SETUP: "supabase_setup.sql" file Supabase Dashboard > SQL Editor mein
-   run karein — saari tables/functions khud ban jayengi. */
+/* ===== SUPABASE BACKEND (with resilient offline local storage fallback) ===== */
 const SB_URL="https://dgwghwkrfiniaperoree.supabase.co";
 const SB_KEY="sb_publishable_bPBx-dIrnlQZmLEGoxfgLQ_Wh7KWsJu";
+
+let _useLocalFallback=false;
+let _localStore=null;
+
+async function _getLocalStore(){
+  if(!_localStore){
+    try{
+      const raw=await _idbGet('pgt_app_data');
+      if(raw)_localStore=JSON.parse(raw);
+    }catch(e){}
+    if(!_localStore||typeof _localStore!=='object')_localStore={};
+  }
+  return _localStore;
+}
+
+async function _saveLocalStore(){
+  if(_localStore){
+    try{
+      await _idbSet('pgt_app_data',JSON.stringify(_localStore));
+    }catch(e){}
+  }
+}
+
+function _getTreeVal(obj,pathStr){
+  if(!pathStr)return obj;
+  const parts=String(pathStr).split('/').filter(Boolean);
+  let cur=obj;
+  for(const part of parts){
+    if(cur==null||typeof cur!=='object')return null;
+    cur=cur[part];
+  }
+  return cur!==undefined?cur:null;
+}
+
+function _setTreeVal(obj,pathStr,val){
+  const parts=String(pathStr).split('/').filter(Boolean);
+  if(!parts.length)return;
+  let cur=obj;
+  for(let i=0;i<parts.length-1;i++){
+    const part=parts[i];
+    if(!cur[part]||typeof cur[part]!=='object')cur[part]={};
+    cur=cur[part];
+  }
+  const last=parts[parts.length-1];
+  if(val===null||val===undefined){
+    delete cur[last];
+  }else{
+    cur[last]=val;
+  }
+}
+
+async function _fallbackRpc(fn,args){
+  const store=await _getLocalStore();
+  args=args||{};
+  if(fn==='db_read'){
+    return _getTreeVal(store,args.p);
+  }
+  if(fn==='db_read_many'){
+    const res={};
+    const paths=args.paths||[];
+    for(const p of paths){
+      res[p]=_getTreeVal(store,p);
+    }
+    return res;
+  }
+  if(fn==='db_write'){
+    _setTreeVal(store,args.p,args.v);
+    await _saveLocalStore();
+    return true;
+  }
+  if(fn==='db_merge'){
+    const cur=_getTreeVal(store,args.p)||{};
+    const merged=(typeof cur==='object'&&typeof args.v==='object')?{...cur,...args.v}:args.v;
+    _setTreeVal(store,args.p,merged);
+    await _saveLocalStore();
+    return true;
+  }
+  if(fn==='db_push'){
+    const id='k_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
+    const subPath=(args.p?args.p+'/':'')+id;
+    _setTreeVal(store,subPath,args.v);
+    await _saveLocalStore();
+    return id;
+  }
+  if(fn==='db_increment'){
+    const cur=Number(_getTreeVal(store,args.p))||0;
+    const delta=Number(args.delta)||1;
+    const nextVal=cur+delta;
+    _setTreeVal(store,args.p,nextVal);
+    await _saveLocalStore();
+    return nextVal;
+  }
+  return null;
+}
+
 async function sbRpc(fn,args){
+  if(_useLocalFallback){
+    return _fallbackRpc(fn,args);
+  }
   let res;
   try{
-    res=await fetch(SB_URL+"/rest/v1/rpc/"+fn,{method:"POST",headers:{"apikey":SB_KEY,"Authorization":"Bearer "+SB_KEY,"Content-Type":"application/json"},body:JSON.stringify(args||{})});
-  }catch(e){throw new Error("Network error — check your internet connection")}
-  if(!res.ok){let msg="Supabase error "+res.status;try{const j=await res.json();msg=j.message||j.details||msg}catch(e){}if(res.status===404&&/function/i.test(msg))msg+=" — please run supabase_setup.sql in Supabase SQL Editor first";throw new Error(msg)}
-  const txt=await res.text();
-  return txt?JSON.parse(txt):null;
+    res=await fetch(SB_URL+"/rest/v1/rpc/"+fn,{
+      method:"POST",
+      headers:{"apikey":SB_KEY,"Authorization":"Bearer "+SB_KEY,"Content-Type":"application/json"},
+      body:JSON.stringify(args||{})
+    });
+    if(!res.ok){
+      console.warn("Supabase "+fn+" returned "+res.status+", using local storage fallback");
+      _useLocalFallback=true;
+      return _fallbackRpc(fn,args);
+    }
+    const txt=await res.text();
+    return txt?JSON.parse(txt):null;
+  }catch(e){
+    console.warn("Supabase network error, using local storage fallback");
+    _useLocalFallback=true;
+    return _fallbackRpc(fn,args);
+  }
 }
 
 const S={user:null,settings:null,hotels:{makkah:[],madina:[]},cities:[{key:"makkah",label:"Makkah"},{key:"madina",label:"Madina"}],transport:[],airlines:[],classes:[],vehicles:[],rooms:[],sectors:[],quotations:{},users:{},branches:{},activeBranch:null};
@@ -258,6 +362,11 @@ function ppVisaTable(o,roe){
   return `<div class="sec"><span class="ic">🛂</span> Visa Details</div><table><thead><tr><th>Visa Type</th><th>Cat</th><th>Qty</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 function ppFooter(s){return `<div class="pp-footer"><div class="ftr2"><div class="ftr2-note">ℹ️ Note: ${s.disclaimer||"All rates are subject to availability & may change without prior notice."}</div><div class="ftr2-dev">Developed by Shahzaman</div></div><div class="thankbar"><span class="ic">✈️</span> Thank you for choosing ${s.company||"Pak Globe Travels"} <span class="ic">✈️</span></div></div>`}
+function ppWatermark(s){
+  const logoSrc=(s&&s.logo)?s.logo:"favicon.png";
+  const compName=(s?.company||"PAK GLOBE TRAVELS").toUpperCase();
+  return `<div class="pp-watermark" aria-hidden="true"><div class="pp-watermark-inner"><img src="${logoSrc}" class="pp-wm-logo" alt="" onerror="this.style.display='none'"><div class="pp-wm-text">${_esc(compName)}</div></div></div>`;
+}
 /* PHANTOM OPTION FILTER (saved quotations): agar option mein sirf default visa
    hai (koi hotel/ticket/transport/additional visa/child/infant nahi) to use
    print/view mein NA dikhao — user ne sirf Option A banaya ho to sirf A aaye,
@@ -489,34 +598,49 @@ function _rawToHotelArr(raw){
 const _hotelsLoading={};
 async function ensureHotelsLoaded(cityKey){
   if(!cityKey)return[];
-  if(S.hotels[cityKey])return S.hotels[cityKey];
+  if(S.hotels[cityKey]&&S.hotels[cityKey].length)return S.hotels[cityKey];
   if(_hotelsLoading[cityKey])return _hotelsLoading[cityKey];
+
+  /* 1. SPEED BOOST: Check IndexedDB instantly */
+  let cached=null;
+  try{const c=await cacheGet("hotels/"+cityKey);if(c&&c.v&&c.v.length)cached=c.v}catch(e){}
+  if(cached&&cached.length){
+    S.hotels[cityKey]=cached;
+    /* Revalidate in background without blocking */
+    setTimeout(async()=>{
+      try{
+        const h=await wt(sbRpc("db_read",{p:"hotels/"+cityKey}),12000);
+        if(h){
+          const arr=_rawToHotelArr(h);
+          if(arr&&arr.length){
+            S.hotels[cityKey]=arr;
+            cacheSet("hotels/"+cityKey,arr);
+            if(curPage==="htl"&&typeof rH==="function")rH();
+          }
+        }
+      }catch(e){/* background revalidate failure is non-fatal */}
+    },100);
+    return cached;
+  }
+
   const p=(async()=>{
-    /* SPEED: pichli baar ki hotels IndexedDB se foran lao — 11MB images har
-       session dobara download nahi hotin. Live fetch background mein update karti hai. */
-    let cached=null;try{const c=await cacheGet("hotels/"+cityKey);if(c&&c.v)cached=c.v}catch(e){}
-    let h;
+    let h=null;
     try{
-      /* Hotels payload bohat bara hota hai (images) — is liye 12s ki jagah 45s timeout */
-      h=await wt(sbRpc("db_read",{p:"hotels/"+cityKey}),45000); // yahan .catch() jaan bhoojh kar NAHI lagaya — fetch fail ho to neeche handle ho
+      h=await wt(sbRpc("db_read",{p:"hotels/"+cityKey}),12000);
     }catch(e){
       if(cached&&cached.length){
-        /* Fetch fail — cached copy dikhao, background mein retry karte raho */
-        console.warn("[Hotels]",cityKey,"live fetch failed — cached copy use ho rahi hai:",e.message);
         S.hotels[cityKey]=cached;delete _hotelsLoading[cityKey];
-        setTimeout(()=>{delete S.hotels[cityKey];ensureHotelsLoaded(cityKey).catch(()=>{})},20000);
         return cached;
       }
       delete _hotelsLoading[cityKey];
-      console.warn("[Hotels] load failed for",cityKey,"— city ko khali NAHI mana, dobara try hoga:",e.message);
-      throw e; // KABHI bhi empty cache mat karo sirf isliye ke fetch fail hui — warna real data "gum" jaisa dikhega
+      console.warn("[Hotels] load failed for",cityKey,":",e.message);
+      return S.hotels[cityKey]||[];
     }
     let arr;
     if(h)arr=_rawToHotelArr(h);
     else if(cityKey==="makkah"){const d=[{n:"MAKKAH TOWER",d:"0m"},{n:"PULLMAN ZAMZAM",d:"0m"},{n:"SWISSOTEL MAKKAH",d:"0m"},{n:"HILTON SUITES",d:"0m"},{n:"HILTON CONVENTION",d:"50m"},{n:"HYATT REGENCY",d:"0m"},{n:"CONRAD MAKKAH",d:"100m"},{n:"JABAL OMAR MARRIOTT",d:"100m"},{n:"MILLENNIUM MAKKAH",d:"300m"},{n:"ELAF KINDA",d:"100m - 200m"},{n:"LE MERIDIEN MAKKAH",d:"SHUTTLE"},{n:"AL MASA GRAND AJYAD",d:"650m - 700m"},{n:"NAWAZI TOWER",d:"SHUTTLE"},{n:"EMAAR WORTH SUITE",d:"400m - 500m"},{n:"ABEER AL FADILAH",d:"SHUTTLE"},{n:"BURJ MUKHTARA",d:"250m - 300m"}];const keyed={};d.forEach(x=>{const id=_newHotelId();keyed[id]={...x,id}});await FS("hotels/makkah",keyed);arr=Object.values(keyed)}
     else if(cityKey==="madina"){const d=[{n:"DAR UL TAQWA",d:"0m"},{n:"OBEROI MADINA",d:"0m"},{n:"SHAZA MADINA",d:"100m"},{n:"PULLMAN MADINA",d:"200m"},{n:"MUKHTARA INTERNATIONAL",d:"250m - 300m"},{n:"MADINA HILTON",d:"200m"},{n:"DAR AL EIMAN GRAND",d:"SHUTTLE"},{n:"RUA AL KHAIR",d:"SHUTTLE"}];const keyed={};d.forEach(x=>{const id=_newHotelId();keyed[id]={...x,id}});await FS("hotels/madina",keyed);arr=Object.values(keyed)}
     else arr=[];
-    /* Fresh copy mil gayi — cache update karo taake agli baar instantly load ho */
     if(arr&&arr.length)cacheSet("hotels/"+cityKey,arr);
     S.hotels[cityKey]=arr;
     delete _hotelsLoading[cityKey];
@@ -1351,11 +1475,96 @@ ${s.logo?`<div class="fg gf"><img src="${s.logo}" style="height:70px;border-radi
 window.uploadBranchLogo=()=>{const f=$("bLogoFile")?.files?.[0];if(!f)return;if(!f.type.startsWith("image/")){toast("Please choose an image file","err");return}compressImg(f,240,0.8).then(dataUrl=>{$("bLogo").value=dataUrl;toast("Logo loaded! Click Save Branch to apply.")}).catch(()=>toast("Could not process image","err"))};
 function readBranchSettings(){return{company:$("bCompany")?.value||"",license:$("bLicense")?.value||"",address:$("bAddress")?.value||"",phone:$("bPhone")?.value||"",whatsapp:$("bWhatsapp")?.value||"",email:$("bEmail")?.value||"",website:$("bWebsite")?.value||"",disclaimer:$("bDisclaimer")?.value||"",invoicePrefix:$("bInvPrefix")?.value||"PGT",invoiceNext:n($("bInvNext")?.value)||1,defaultROE:n($("bROE")?.value)||78,visaAdultSAR:n($("bVisaSAR")?.value)||560,brandColor:$("bBrandColor")?.value||"#1e40af",logo:$("bLogo")?.value||"",instructions:$("bInstructions")?.value||""}};
 
-const pgs=[{id:"dash",ic:"📊",lb:"Dashboard",rl:["superadmin","admin","user"]},{id:"pvt",ic:"📝",lb:"Private Costing",rl:["superadmin","admin","user"]},{id:"grp",ic:"👥",lb:"Group Costing",rl:["superadmin","admin","user"]},{id:"quot",ic:"📋",lb:"My Quotations",rl:["superadmin","admin","user"]},{id:"allquot",ic:"🗂",lb:"All Quotations",rl:["superadmin","admin"]},{id:"dup",ic:"🔁",lb:"Duplicate Finder",rl:["superadmin","admin","user"]},{id:"htl",ic:"🏨",lb:"Hotels",rl:["superadmin","admin","user"]},{id:"trn",ic:"🚐",lb:"Transport",rl:["superadmin","admin","user"]},{id:"lst",ic:"📑",lb:"Lists Manager",rl:["superadmin","admin","user"]},{id:"usr",ic:"👤",lb:"Users",rl:["superadmin","admin"]},{id:"bin",ic:"🗑️",lb:"Recycle Bin",rl:["superadmin","admin","user"]},{id:"branches",ic:"🏢",lb:"Branches",rl:["superadmin"]},{id:"set",ic:"⚙️",lb:"Settings",rl:["superadmin","admin"]}];
+const navSections=[
+  {
+    title:"Main",
+    items:[
+      {id:"dash",lb:"Dashboard",rl:["superadmin","admin","user"]},
+      {id:"pvt",lb:"Private Costing",rl:["superadmin","admin","user"]},
+      {id:"grp",lb:"Group Costing",rl:["superadmin","admin","user"]}
+    ]
+  },
+  {
+    title:"Quotations",
+    items:[
+      {id:"quot",lb:"My Quotations",rl:["superadmin","admin","user"]},
+      {id:"allquot",lb:"All Quotations",rl:["superadmin","admin"]},
+      {id:"dup",lb:"Duplicate Finder",rl:["superadmin","admin","user"]}
+    ]
+  },
+  {
+    title:"Master Inventory",
+    items:[
+      {id:"htl",lb:"Hotels",rl:["superadmin","admin","user"]},
+      {id:"trn",lb:"Transport",rl:["superadmin","admin","user"]},
+      {id:"lst",lb:"Lists Manager",rl:["superadmin","admin","user"]}
+    ]
+  },
+  {
+    title:"Administration",
+    items:[
+      {id:"usr",lb:"Users",rl:["superadmin","admin"]},
+      {id:"branches",lb:"Branches",rl:["superadmin"]},
+      {id:"set",lb:"Settings",rl:["superadmin","admin"]},
+      {id:"bin",lb:"Recycle Bin",rl:["superadmin","admin","user"]}
+    ]
+  }
+];
 
-function buildSB(){const nv=$("SN");nv.innerHTML="";
-  if(S.activeBranch&&S.user.r!=="superadmin"){const bDiv=CE("div","",`<div style="padding:6px 11px 2px;font-size:.65rem;color:rgba(255,255,255,.55);text-transform:uppercase;letter-spacing:.5px">Current Branch</div><div style="padding:4px 11px 8px;font-size:.8rem;font-weight:700;color:rgba(255,255,255,.9);border-bottom:1px solid rgba(255,255,255,.12);margin-bottom:4px">${S.activeBranch.name||""}</div>`);nv.appendChild(bDiv)}
-  pgs.forEach(p=>{if(!P(p.id,"view"))return;const d=CE("div","sb-i",`<span class="ic">${p.ic}</span><span>${p.lb}</span>`);d.dataset.page=p.id;d.onclick=()=>{editKey=null;nav(p.id);if(innerWidth<769)closeSB()};nv.appendChild(d)});
+const pgs=navSections.flatMap(s=>s.items);
+
+function getNavSvg(id){
+  const svgs={
+    dash:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>`,
+    pvt:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="2.5"/><line x1="8" y1="6" x2="16" y2="6"/><line x1="16" y1="14" x2="16" y2="18"/><path d="M8 10h.01M12 10h.01M16 10h.01M8 14h.01M12 14h.01M8 18h.01M12 18h.01"/></svg>`,
+    grp:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+    quot:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="m9 15 2 2 4-4"/></svg>`,
+    allquot:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M8 13h8M8 16h5"/></svg>`,
+    dup:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`,
+    htl:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><path d="M5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16"/><path d="M9 7h1M14 7h1M9 11h1M14 11h1M9 15h1M14 15h1"/><path d="M10 21v-3a2 2 0 0 1 4 0v3"/></svg>`,
+    trn:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6v6"/><path d="M15 6v6"/><path d="M2 12h19.6"/><path d="M18 18h3s.5-1.7.8-2.8c.1-.4.2-.8.2-1.2 0-.8-.7-1.4-1.5-1.4H2.5c-.8 0-1.5.6-1.5 1.4 0 .4.1.8.2 1.2L2 18h3"/><circle cx="7" cy="18" r="2"/><circle cx="16" cy="18" r="2"/><path d="M3 12V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v7"/></svg>`,
+    lst:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1.5"/><circle cx="4" cy="12" r="1.5"/><circle cx="4" cy="18" r="1.5"/></svg>`,
+    usr:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/><path d="M17 11l2 2 4-4"/></svg>`,
+    branches:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="7" height="6" rx="1.5"/><rect x="15" y="15" width="7" height="6" rx="1.5"/><rect x="2" y="15" width="7" height="6" rx="1.5"/><path d="M5.5 9v3a2 2 0 0 0 2 2h11v-2M5.5 14h-2"/></svg>`,
+    set:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>`,
+    bin:`<svg class="sb-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>`
+  };
+  return svgs[id]||`<span class="ic">📄</span>`;
+}
+
+function buildSB(){
+  const nv=$("SN");if(!nv)return;
+  nv.innerHTML="";
+  if(S.activeBranch&&S.user.r!=="superadmin"){
+    const bDiv=CE("div","sb-branch-box",`<div style="font-size:.62rem;color:#93c5fd;text-transform:uppercase;letter-spacing:.6px;font-weight:800">Current Branch</div><div style="font-size:.82rem;font-weight:800;color:#ffffff;margin-top:2px">${_esc(S.activeBranch.name||"")}</div>`);
+    nv.appendChild(bDiv);
+  }
+
+  /* Compute count badges */
+  const myQuotCount=Object.values(S.quotations||{}).filter(q=>q.createdBy===S.user.u).length;
+  const allQuotCount=Object.keys(S.quotations||{}).length;
+  let totalHotelsCount=0;
+  Object.values(S.hotels||{}).forEach(list=>{if(Array.isArray(list))totalHotelsCount+=list.length});
+
+  navSections.forEach(sec=>{
+    const visibleItems=sec.items.filter(p=>P(p.id,"view"));
+    if(!visibleItems.length)return;
+    const titleEl=CE("div","sb-sec-title",sec.title);
+    nv.appendChild(titleEl);
+
+    visibleItems.forEach(p=>{
+      let badgeHtml="";
+      if(p.id==="quot"&&myQuotCount>0)badgeHtml=`<span class="sb-badge">${myQuotCount}</span>`;
+      else if(p.id==="allquot"&&allQuotCount>0)badgeHtml=`<span class="sb-badge">${allQuotCount}</span>`;
+      else if(p.id==="htl"&&totalHotelsCount>0)badgeHtml=`<span class="sb-badge">${totalHotelsCount}</span>`;
+
+      const d=CE("div","sb-i",`${getNavSvg(p.id)}<span class="sb-label">${p.lb}</span>${badgeHtml}`);
+      d.dataset.page=p.id;
+      d.onclick=()=>{editKey=null;nav(p.id);if(innerWidth<769)closeSB()};
+      nv.appendChild(d);
+    });
+  });
+
   const curItem=nv.querySelector(`[data-page="${curPage}"]`)||nv.querySelector(".sb-i");
   curItem?.classList.add("on");
 }
@@ -1639,18 +1848,38 @@ window.discardDraft = (pt) => {
   $("draftBanner")?.remove();
   toast("Draft discarded");
 };
-function clearDraft(pt){delete _draftMem["draft_"+pt];try{localStorage.removeItem("pgt_draft_"+pt)}catch(e){}}
 
 
-window.showModal=(title,html,onOk,okLabel)=>{$("MD").innerHTML=`<div class="modal-bg"><div class="modal"><h3>${title}</h3>${html}<div class="modal-actions"><button class="btn btn-o" onclick="closeModal()">Cancel</button><button class="btn btn-p" id="mdOK">${okLabel||"Save"}</button></div></div></div>`;$("mdOK").onclick=()=>{const result=onOk();if(result!==false)closeModal()}};
+window.showModal=(title,html,onOk,okLabel)=>{
+  $("MD").innerHTML=`<div class="modal-bg" id="mdBackdrop"><div class="modal"><div class="modal-h-custom"><h3>${title}</h3><button type="button" class="modal-close-btn" onclick="closeModal()" title="Close (ESC)">✕</button></div>${html}<div class="modal-actions"><button type="button" class="btn btn-o" onclick="closeModal()">Cancel</button><button type="button" class="btn btn-p" id="mdOK">${okLabel||"Save"}</button></div></div></div>`;
+  const bg=$("mdBackdrop");
+  if(bg){bg.onclick=(e)=>{if(e.target===bg)closeModal();};}
+  const okBtn=$("mdOK");
+  if(okBtn){
+    okBtn.onclick=()=>{
+      if(typeof onOk==="function"){
+        const result=onOk();
+        if(result!==false)closeModal();
+      }else{
+        closeModal();
+      }
+    };
+  }
+};
+
+window.showCustomModal=(title,contentHtml)=>{
+  $("MD").innerHTML=`<div class="modal-bg" id="mdBackdrop"><div class="modal modal-lg"><div class="modal-h-custom"><h3>${title}</h3><button type="button" class="modal-close-btn" onclick="closeModal()" title="Close (ESC)">✕</button></div>${contentHtml}</div></div>`;
+  const bg=$("mdBackdrop");
+  if(bg){bg.onclick=(e)=>{if(e.target===bg)closeModal();};}
+};
+
 window.closeModal=()=>{$("MD").innerHTML=""};
 /* ===== STYLED CONFIRM MODAL (replaces browser confirm()) ===== */
 function confirmModal(msg,onYes,yesLabel,yesCls){
   yesLabel=yesLabel||"Yes, Delete";yesCls=yesCls||"btn-d";
-  $("MD").innerHTML=`<div class="modal-bg"><div class="modal" style="max-width:380px"><h3 style="color:var(--er)">⚠️ Confirm</h3><p style="margin-bottom:14px;font-size:.88rem;color:var(--t)">${msg}</p><div class="modal-actions"><button type="button" class="btn btn-o" id="cfNo">Cancel</button><button type="button" class="btn ${yesCls}" id="cfYes">${yesLabel}</button></div></div></div>`;
-  // Bind with real addEventListener (not inline-onclick + a shared global
-  // variable) so double-taps, fast re-opens, or the modal being re-rendered
-  // mid-click can never leave the Yes/Cancel button silently doing nothing.
+  $("MD").innerHTML=`<div class="modal-bg" id="mdBackdrop"><div class="modal" style="max-width:380px"><div class="modal-h-custom"><h3 style="color:var(--er)">⚠️ Confirm</h3><button type="button" class="modal-close-btn" onclick="closeModal()" title="Close">✕</button></div><p style="margin-bottom:14px;font-size:.88rem;color:var(--t)">${msg}</p><div class="modal-actions"><button type="button" class="btn btn-o" id="cfNo">Cancel</button><button type="button" class="btn ${yesCls}" id="cfYes">${yesLabel}</button></div></div></div>`;
+  const bg=$("mdBackdrop");
+  if(bg){bg.onclick=(e)=>{if(e.target===bg)closeModal();};}
   const yesBtn=$("cfYes"),noBtn=$("cfNo");
   let done=false;
   const finish=(runCb)=>{
@@ -1918,12 +2147,66 @@ let _printData=null;
 let _printFilename="Quotation.pdf";
 let _isPrinting=false;
 let _isGeneratingPdf=false;
+let _printWatermarkEnabled=true;
+
+function getCurrentDateStr(){
+  const now=new Date();
+  const y=now.getFullYear();
+  const m=String(now.getMonth()+1).padStart(2,"0");
+  const d=String(now.getDate()).padStart(2,"0");
+  return `${y}-${m}-${d}`;
+}
+
+function formatPdfFilename(clientName,fallbackPrefix="Quotation",invoiceNo=""){
+  const dateStr=getCurrentDateStr();
+  const rawClient=(clientName||"").trim().replace(/[^a-zA-Z0-9_\- ]/g,"").trim();
+  const cleanClient=rawClient.replace(/\s+/g,"_");
+  const cleanInv=(invoiceNo||"").trim().replace(/[^a-zA-Z0-9_\-]/g,"");
+
+  let base="";
+  if(cleanClient){
+    base=cleanClient;
+    if(cleanInv&&cleanInv!=="DRAFT"){
+      base+="_"+cleanInv;
+    }
+  }else if(fallbackPrefix){
+    const cleanPrefix=fallbackPrefix.trim().replace(/[^a-zA-Z0-9_\- ]/g,"").trim().replace(/\s+/g,"_");
+    base=cleanPrefix||"Quotation";
+    if(cleanInv&&cleanInv!=="DRAFT"){
+      base+="_"+cleanInv;
+    }
+  }else{
+    base="Quotation";
+  }
+
+  return `${base}_${dateStr}.pdf`;
+}
+
+window.togglePrintWatermark=function(){
+  _printWatermarkEnabled=!_printWatermarkEnabled;
+  const btn=$("wmToggleBtn");
+  const pb=$("printBody");
+  if(pb){
+    pb.classList.toggle("hide-watermark",!_printWatermarkEnabled);
+  }
+  if(btn){
+    btn.innerHTML=_printWatermarkEnabled?"💧 Watermark: ON":"💧 Watermark: OFF";
+    btn.style.background=_printWatermarkEnabled?"#0284c7":"#64748b";
+  }
+  toast(_printWatermarkEnabled?"Watermark enabled":"Watermark hidden");
+};
 
 const PP_PRINT_CSS=`
 *{box-sizing:border-box}
 @page{size:A4;margin:0}
 html,body{margin:0;padding:0;background:#fff}
-.pp{background:#fff;color:#0f172a;padding:6mm 9mm 9mm;font-size:9.5px;width:210mm;max-width:210mm;min-height:296mm;margin:0 auto;font-family:'Segoe UI',Arial,sans-serif;display:flex;flex-direction:column}
+.pp{background:#fff;color:#0f172a;padding:6mm 9mm 9mm;font-size:9.5px;width:210mm;max-width:210mm;min-height:296mm;margin:0 auto;font-family:'Segoe UI',Arial,sans-serif;display:flex;flex-direction:column;position:relative;overflow:hidden}
+.pp > *:not(.pp-watermark){position:relative;z-index:2}
+.pp .pp-watermark{position:absolute;top:0;left:0;right:0;bottom:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:1;user-select:none;-webkit-user-select:none;overflow:hidden}
+.pp .pp-watermark-inner{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;transform:rotate(-24deg);opacity:0.06;width:150mm;max-width:85%;text-align:center;pointer-events:none}
+.pp .pp-wm-logo{width:92mm;height:92mm;max-width:100%;object-fit:contain;filter:grayscale(12%);display:block}
+.pp .pp-wm-text{font-family:'Outfit','Segoe UI',Arial,sans-serif;font-size:24px;font-weight:900;letter-spacing:5px;color:var(--brand,#1F4AA8);text-transform:uppercase;white-space:nowrap;line-height:1}
+.hide-watermark .pp-watermark,.no-watermark .pp-watermark{display:none!important}
 .pp .pp-body{display:block;flex:1 0 auto}
 .pp *{font-family:'Segoe UI',Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact;color-adjust:exact;box-sizing:border-box}
 .pp .hdr{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding-bottom:8px;margin-bottom:8px;border-bottom:2px solid var(--brand,#1F4AA8)}
@@ -2017,8 +2300,24 @@ html,body{margin:0;padding:0;background:#fff}
 function openPrintPreview(html,filename,data){
   _printHTML=html;
   _printData=data||null;
-  _printFilename=(filename||"Quotation")+".pdf";
+  const cName=data?.d?.clientName||(typeof filename==="string"?filename:"");
+  const inv=data?.d?.invoiceNo||"";
+  if(typeof filename==="string"&&filename.includes(getCurrentDateStr())&&filename.toLowerCase().endsWith(".pdf")){
+    _printFilename=filename;
+  }else if(typeof filename==="string"&&filename.includes(getCurrentDateStr())){
+    _printFilename=filename+".pdf";
+  }else{
+    _printFilename=formatPdfFilename(cName||filename,"Quotation",inv);
+  }
   $("printBody").innerHTML="<div>"+html+"</div>";
+  if($("printBody")){
+    $("printBody").classList.toggle("hide-watermark",!_printWatermarkEnabled);
+  }
+  const btn=$("wmToggleBtn");
+  if(btn){
+    btn.innerHTML=_printWatermarkEnabled?"💧 Watermark: ON":"💧 Watermark: OFF";
+    btn.style.background=_printWatermarkEnabled?"#0284c7":"#64748b";
+  }
   $("printOverlay").classList.add("active");
   document.body.style.overflow="hidden";
 }
@@ -2106,10 +2405,12 @@ window.doPrintNow=function(){
   const resolvedPrintCSS=_inlineVars(PP_PRINT_CSS,brand);
 
   // Build complete standalone HTML — no external font deps, no CSS vars
+  const cleanDocTitle=(_printFilename||"Quotation").replace(/\.pdf$/i,"");
   const iframeDoc=`<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${_esc(cleanDocTitle)}</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 @page{size:A4 portrait;margin:0}
@@ -2569,6 +2870,7 @@ async function renderGrpPdf(pdf,d,s){
 function _fitImagesForCapture(root){
   root.querySelectorAll("img").forEach(img=>{
     try{
+      if(img.classList.contains("pp-wm-logo")||img.closest(".pp-watermark")||img.closest(".cost-wm"))return;
       const fit=getComputedStyle(img).objectFit;
       if((fit!=="cover"&&fit!=="contain")||!img.naturalWidth)return;
       const w=img.clientWidth||img.offsetWidth,h=img.clientHeight||img.offsetHeight;
@@ -2600,7 +2902,7 @@ window.downloadPdfNow=async function(){
   _isGeneratingPdf=true;
   toast("Generating PDF...");
   const holder=document.createElement("div");
-  holder.className="pdf-capture-mode";
+  holder.className="pdf-capture-mode"+(_printWatermarkEnabled?"":" hide-watermark");
   holder.style.cssText="position:fixed;left:-99999px;top:0;background:#fff;z-index:-1;";
   holder.innerHTML="<div>"+_printHTML+"</div>";
   document.body.appendChild(holder);
@@ -2659,8 +2961,17 @@ window.downloadPdfNow=async function(){
       // image-only visually (still shown correctly) but aren't copyable.
       addInvisibleTextLayer(pdf,pages[i],pageRect,scaleFactor,xOff);
     }
-    pdf.save(_printFilename);
-    toast("PDF downloaded!");
+    let exportFilename=_printFilename;
+    if(!exportFilename||exportFilename==="Quotation.pdf"||!exportFilename.includes(getCurrentDateStr())){
+      const cName=_printData?.d?.clientName||$("pN")?.value||$("gN")?.value||"";
+      const inv=_printData?.d?.invoiceNo||"";
+      exportFilename=formatPdfFilename(cName,"Quotation",inv);
+    }
+    if(!exportFilename.endsWith(".pdf")){
+      exportFilename+=".pdf";
+    }
+    pdf.save(exportFilename);
+    toast("PDF downloaded: "+exportFilename);
   }catch(e){console.error("[PDF]",e);toast("PDF error: "+e.message,"err")}
   finally{document.body.removeChild(holder);_isGeneratingPdf=false}
 };
@@ -2712,6 +3023,266 @@ window.doSaveAsPdf=()=>{
   window.doPrintNow();
 };
 
+/* ========== DASHBOARD DATA VISUALIZATIONS & METRICS ========== */
+let _dashTooltipEl=null;
+function _getDashTooltip(){
+  if(!_dashTooltipEl){
+    _dashTooltipEl=document.createElement("div");
+    _dashTooltipEl.className="dash-viz-tooltip";
+    document.body.appendChild(_dashTooltipEl);
+  }
+  return _dashTooltipEl;
+}
+function _showDashTooltip(e,html){
+  const tt=_getDashTooltip();
+  tt.innerHTML=html;
+  tt.style.left=((e.pageX!=null?e.pageX:e.clientX+window.scrollX))+"px";
+  tt.style.top=((e.pageY!=null?e.pageY:e.clientY+window.scrollY)-14)+"px";
+  tt.style.opacity="1";
+}
+function _moveDashTooltip(e){
+  const tt=_getDashTooltip();
+  tt.style.left=((e.pageX!=null?e.pageX:e.clientX+window.scrollX))+"px";
+  tt.style.top=((e.pageY!=null?e.pageY:e.clientY+window.scrollY)-14)+"px";
+}
+function _hideDashTooltip(){
+  if(_dashTooltipEl)_dashTooltipEl.style.opacity="0";
+}
+
+window.approveQuotation=async function(k){
+  const q=S.quotations&&S.quotations[k];
+  if(!q){toast("Quotation not found","err");return}
+  const isOwn=q.createdBy===S.user.u;
+  if(!P("allquot","edit")&&(!isOwn||!P("quot","edit"))){
+    toast("You don't have permission to approve quotations","err");
+    return;
+  }
+  q.status="approved";
+  q.approvedBy=S.user.u;
+  q.approvedAt=new Date().toISOString();
+  try{
+    await bFS("quotations/"+k,q);
+    toast(`Quotation ${q.invoiceNo||""} marked as Approved!`);
+    if(curPage==="dash"){
+      const pg=$("CT");
+      if(pg)pgDash(pg);
+    }else if(curPage==="quot"){
+      rQLCore();
+    }else if(curPage==="allquot"){
+      rQLAllCore();
+    }
+  }catch(e){
+    toast("Approval update failed: "+e.message,"err");
+  }
+};
+
+window.rejectQuotation=async function(k){
+  const q=S.quotations&&S.quotations[k];
+  if(!q){toast("Quotation not found","err");return}
+  const isOwn=q.createdBy===S.user.u;
+  if(!P("allquot","edit")&&(!isOwn||!P("quot","edit"))){
+    toast("You don't have permission to reject quotations","err");
+    return;
+  }
+  confirmModal(`Reject quotation <b>${_esc(q.invoiceNo||"Quotation")}</b> (${_esc(q.clientName||"—")})?`,async()=>{
+    q.status="rejected";
+    q.rejectedBy=S.user.u;
+    q.rejectedAt=new Date().toISOString();
+    try{
+      await bFS("quotations/"+k,q);
+      toast("Quotation marked as Rejected");
+      if(curPage==="dash"){
+        const pg=$("CT");
+        if(pg)pgDash(pg);
+      }else if(curPage==="quot"){
+        rQLCore();
+      }else if(curPage==="allquot"){
+        rQLAllCore();
+      }
+    }catch(e){
+      toast("Rejection failed: "+e.message,"err");
+    }
+  },"Yes, Reject","btn-d");
+};
+
+function renderDashMonthlyTrendChart(containerId,chartData){
+  const container=document.getElementById(containerId);
+  if(!container)return;
+  container.innerHTML="";
+  const rect=container.getBoundingClientRect();
+  const width=Math.max(260,rect.width||340);
+  const height=130;
+  const margin={top:18,right:10,bottom:22,left:18};
+  const innerWidth=width-margin.left-margin.right;
+  const innerHeight=height-margin.top-margin.bottom;
+
+  if(typeof d3!=="undefined"){
+    const svg=d3.select(container)
+      .append("svg")
+      .attr("viewBox",`0 0 ${width} ${height}`)
+      .attr("preserveAspectRatio","xMidYMid meet")
+      .style("width","100%")
+      .style("height","100%")
+      .style("overflow","visible");
+
+    const defs=svg.append("defs");
+    const gradPrimary=defs.append("linearGradient")
+      .attr("id","dashBarGradP")
+      .attr("x1","0%").attr("y1","0%").attr("x2","0%").attr("y2","100%");
+    gradPrimary.append("stop").attr("offset","0%").attr("stop-color","var(--p, #1e40af)").attr("stop-opacity","1");
+    gradPrimary.append("stop").attr("offset","100%").attr("stop-color","var(--pl, #3b82f6)").attr("stop-opacity","0.8");
+
+    const gradMuted=defs.append("linearGradient")
+      .attr("id","dashBarGradM")
+      .attr("x1","0%").attr("y1","0%").attr("x2","0%").attr("y2","100%");
+    gradMuted.append("stop").attr("offset","0%").attr("stop-color","#94a3b8").attr("stop-opacity","0.9");
+    gradMuted.append("stop").attr("offset","100%").attr("stop-color","#cbd5e1").attr("stop-opacity","0.55");
+
+    const maxVal=Math.max(1,d3.max(chartData,d=>d.total)||1);
+    const x=d3.scaleBand()
+      .domain(chartData.map(d=>d.label))
+      .range([0,innerWidth])
+      .padding(0.32);
+
+    const y=d3.scaleLinear()
+      .domain([0,maxVal*1.22])
+      .range([innerHeight,0]);
+
+    const g=svg.append("g")
+      .attr("transform",`translate(${margin.left},${margin.top})`);
+
+    // Subtle grid lines
+    g.append("g")
+      .call(d3.axisLeft(y).ticks(3).tickSize(-innerWidth).tickFormat(""))
+      .selectAll("line")
+      .attr("stroke","var(--bd, rgba(0,0,0,0.06))")
+      .attr("stroke-dasharray","3,3");
+    g.selectAll(".domain").remove();
+
+    // Bars
+    const barGroups=g.selectAll(".dash-bar-g")
+      .data(chartData)
+      .enter()
+      .append("g")
+      .attr("class","dash-bar-g");
+
+    barGroups.append("rect")
+      .attr("x",d=>x(d.label))
+      .attr("y",d=>y(d.total))
+      .attr("width",x.bandwidth())
+      .attr("height",d=>Math.max(3,innerHeight-y(d.total)))
+      .attr("rx",4)
+      .attr("ry",4)
+      .attr("fill",d=>d.isCurrent?"url(#dashBarGradP)":"url(#dashBarGradM)")
+      .style("cursor","pointer")
+      .style("transition","transform .18s, opacity .18s")
+      .on("mouseenter",function(event,d){
+        d3.select(this).style("opacity","0.85").style("transform","scaleY(1.03)");
+        _showDashTooltip(event,`<b>${d.monthName} ${d.year}</b><br>Quotations: <b>${d.total}</b> (Private: ${d.pvt}, Group: ${d.grp})<br>Total Quoted: <b>PKR ${fmt(d.amount)}</b>`);
+      })
+      .on("mousemove",function(event){
+        _moveDashTooltip(event);
+      })
+      .on("mouseleave",function(){
+        d3.select(this).style("opacity","1").style("transform","none");
+        _hideDashTooltip();
+      });
+
+    // Bar top value numbers
+    barGroups.append("text")
+      .attr("x",d=>x(d.label)+x.bandwidth()/2)
+      .attr("y",d=>y(d.total)-4)
+      .attr("text-anchor","middle")
+      .attr("fill",d=>d.isCurrent?"var(--p, #1e40af)":"var(--t2, #64748b)")
+      .attr("font-size","10px")
+      .attr("font-weight",d=>d.isCurrent?"700":"600")
+      .text(d=>d.total>0?d.total:"");
+
+    // X Axis Month Labels
+    g.append("g")
+      .attr("transform",`translate(0,${innerHeight})`)
+      .call(d3.axisBottom(x).tickSize(0))
+      .selectAll("text")
+      .attr("dy","11px")
+      .attr("fill",(d,i)=>chartData[i]?.isCurrent?"var(--p, #1e40af)":"var(--t2, #64748b)")
+      .attr("font-size","10px")
+      .attr("font-weight",(d,i)=>chartData[i]?.isCurrent?"700":"500");
+
+    g.selectAll(".domain").attr("stroke","var(--bd, #cbd5e1)");
+  }
+}
+
+function renderDashApprovalDonutChart(containerId,statusData){
+  const container=document.getElementById(containerId);
+  if(!container)return;
+  container.innerHTML="";
+  const width=130;
+  const height=130;
+  const radius=Math.min(width,height)/2;
+  const innerRadius=radius*0.64;
+
+  if(typeof d3!=="undefined"){
+    const svg=d3.select(container)
+      .append("svg")
+      .attr("viewBox",`0 0 ${width} ${height}`)
+      .style("width","100%")
+      .style("height","100%")
+      .append("g")
+      .attr("transform",`translate(${width/2},${height/2})`);
+
+    const colorMap={
+      approved:"#10b981",
+      pending:"#f59e0b",
+      rejected:"#ef4444"
+    };
+
+    const total=statusData.reduce((s,d)=>s+d.count,0);
+    const chartDataset=total===0?[{key:"none",label:"No data",count:1,color:"#e2e8f0"}]:statusData.filter(d=>d.count>0);
+
+    const pie=d3.pie()
+      .value(d=>d.count)
+      .sort(null)
+      .padAngle(total>0&&chartDataset.length>1?0.04:0);
+
+    const arc=d3.arc()
+      .innerRadius(innerRadius)
+      .outerRadius(radius-4)
+      .cornerRadius(total>0?4:0);
+
+    const arcHover=d3.arc()
+      .innerRadius(innerRadius-2)
+      .outerRadius(radius)
+      .cornerRadius(total>0?4:0);
+
+    const slices=svg.selectAll(".dash-slice")
+      .data(pie(chartDataset))
+      .enter()
+      .append("g")
+      .attr("class","dash-slice");
+
+    slices.append("path")
+      .attr("d",arc)
+      .attr("fill",d=>d.data.color||colorMap[d.data.key]||"#94a3b8")
+      .style("cursor",total>0?"pointer":"default")
+      .style("transition","all .18s ease")
+      .on("mouseenter",function(event,d){
+        if(total===0)return;
+        d3.select(this).attr("d",arcHover);
+        const pct=Math.round((d.data.count/total)*100);
+        _showDashTooltip(event,`<b>${d.data.label}</b><br>Count: <b>${d.data.count}</b> (${pct}%)<br>Quoted Volume: <b>PKR ${fmt(d.data.amount||0)}</b>`);
+      })
+      .on("mousemove",function(event){
+        if(total===0)return;
+        _moveDashTooltip(event);
+      })
+      .on("mouseleave",function(){
+        if(total===0)return;
+        d3.select(this).attr("d",arc);
+        _hideDashTooltip();
+      });
+  }
+}
+
 /* ========== PAGES ========== */
 
 function pgDash(pg){
@@ -2724,16 +3295,196 @@ let my=seeAll?q:q.filter(([k,v])=>v.createdBy===S.user.u);
 if(S.activeBranch?.id&&!seeAll){my=my.filter(([k,v])=>!v.branchId||v.branchId===S.activeBranch.id)}
 const pv=my.filter(([k,v])=>v.type==="private"),gr=my.filter(([k,v])=>v.type==="group");
 const dashTitle=seeAll?"All Quotations":"My Quotations";
-/* Revenue analytics */
+
+/* Month & Performance Metrics */
 const now=new Date(),thisM=now.getMonth(),thisY=now.getFullYear();
+const monthNames=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const fullMonthNames=["January","February","March","April","May","June","July","August","September","October","November","December"];
+const curMonthLabel=`${monthNames[thisM]} ${thisY}`;
+
+// This month quotations
+const thisMonthQuots=my.filter(([k,v])=>{
+  if(!v||!v.createdAt)return false;
+  const d=new Date(v.createdAt);
+  return d.getMonth()===thisM&&d.getFullYear()===thisY;
+});
+const thisMonthTotal=thisMonthQuots.length;
+const thisMonthPvt=thisMonthQuots.filter(([k,v])=>v.type==="private").length;
+const thisMonthGrp=thisMonthQuots.filter(([k,v])=>v.type==="group").length;
+const thisMonthAmount=thisMonthQuots.reduce((s,[k,v])=>s+(v.totalAdult||0),0);
+
+// Last month quotations
+const lastMDate=new Date(thisY,thisM-1,1);
+const lastM=lastMDate.getMonth(),lastMY=lastMDate.getFullYear();
+const lastMonthQuots=my.filter(([k,v])=>{
+  if(!v||!v.createdAt)return false;
+  const d=new Date(v.createdAt);
+  return d.getMonth()===lastM&&d.getFullYear()===lastMY;
+});
+const lastMonthTotal=lastMonthQuots.length;
+
+// Trend calculation
+let trendClass="neutral",trendHtml="— steady";
+if(lastMonthTotal>0){
+  const diff=thisMonthTotal-lastMonthTotal;
+  const pct=Math.round((diff/lastMonthTotal)*100);
+  if(pct>0){
+    trendClass="up";
+    trendHtml=`↑ +${pct}% vs last mo`;
+  }else if(pct<0){
+    trendClass="down";
+    trendHtml=`↓ ${pct}% vs last mo`;
+  }else{
+    trendClass="neutral";
+    trendHtml=`= Same as last mo`;
+  }
+}else if(thisMonthTotal>0){
+  trendClass="up";
+  trendHtml=`↑ ${thisMonthTotal} new this mo`;
+}
+
+// Approvals and status breakdown
+const pendingQuots=my.filter(([k,v])=>(v.status||"pending")==="pending");
+const approvedQuots=my.filter(([k,v])=>v.status==="approved"||v.status==="confirmed");
+const rejectedQuots=my.filter(([k,v])=>v.status==="rejected");
+const pendingCount=pendingQuots.length;
+const approvedCount=approvedQuots.length;
+const rejectedCount=rejectedQuots.length;
+const pendingAmount=pendingQuots.reduce((s,[k,v])=>s+(v.totalAdult||0),0);
+const approvedAmount=approvedQuots.reduce((s,[k,v])=>s+(v.totalAdult||0),0);
+const rejectedAmount=rejectedQuots.reduce((s,[k,v])=>s+(v.totalAdult||0),0);
+const totalCount=my.length;
+const approvalRate=totalCount>0?Math.round((approvedCount/totalCount)*100):0;
+
+// 6-Month Trend Data for D3
+const trend6mData=[];
+for(let i=5;i>=0;i--){
+  const targetD=new Date(thisY,thisM-i,1);
+  const tm=targetD.getMonth(),ty=targetD.getFullYear();
+  const inMonth=my.filter(([k,v])=>{
+    if(!v||!v.createdAt)return false;
+    const d=new Date(v.createdAt);
+    return d.getMonth()===tm&&d.getFullYear()===ty;
+  });
+  const pvtC=inMonth.filter(([k,v])=>v.type==="private").length;
+  const grpC=inMonth.filter(([k,v])=>v.type==="group").length;
+  const amt=inMonth.reduce((s,[k,v])=>s+(v.totalAdult||0),0);
+  trend6mData.push({
+    label:monthNames[tm],
+    monthName:fullMonthNames[tm],
+    year:ty,
+    month:tm,
+    total:inMonth.length,
+    pvt:pvtC,
+    grp:grpC,
+    amount:amt,
+    isCurrent:(i===0)
+  });
+}
+
+// Status breakdown data for D3 Donut
+const statusData=[
+  {key:"approved",label:"Approved",count:approvedCount,amount:approvedAmount,color:"#10b981"},
+  {key:"pending",label:"Pending Approval",count:pendingCount,amount:pendingAmount,color:"#f59e0b"},
+  {key:"rejected",label:"Rejected",count:rejectedCount,amount:rejectedAmount,color:"#ef4444"}
+];
+
 /* Top 5 clients */
 const clientMap={};my.forEach(([k,v])=>{const cn=(v.clientName||"Unknown").trim();if(!cn||cn==="—")return;if(!clientMap[cn])clientMap[cn]=0;clientMap[cn]+=(v.totalAdult||0)});
 const topClients=Object.entries(clientMap).sort((a,b)=>b[1]-a[1]).slice(0,5);
+
+/* Pending items preview HTML */
+const pendingPreviewList=pendingQuots.slice(0,4);
+const pendingListHtml=pendingPreviewList.length?`
+  <div class="dash-pending-items">
+    ${pendingPreviewList.map(([k,v])=>{
+      const isGrp=v.type==="group";
+      return `
+        <div class="dash-pending-row">
+          <div class="dash-pending-meta">
+            <div class="dash-pending-name">${_esc(v.clientName)||"—"} <span class="bd bd-${isGrp?"a":"u"}">${v.type}</span></div>
+            <div class="dash-pending-sub">${_esc(v.invoiceNo)||""} • PKR ${fmt(v.totalAdult||0)} • ${fmtDT(v.createdAt)}</div>
+          </div>
+          <div class="dash-pending-acts">
+            <button class="btn-approve-sm" onclick="approveQuotation('${k}')" title="Approve quotation">✓ Approve</button>
+            <button class="btn-icon" onclick="viewQ('${k}')" title="View details">👁</button>
+          </div>
+        </div>
+      `;
+    }).join("")}
+  </div>
+`:`<p style="font-size:.72rem;color:var(--ok);padding:6px 0;margin:0;display:flex;align-items:center;gap:5px">✨ All quotations are up to date and approved!</p>`;
+
 pg.innerHTML=`<div class="stats"><div class="st"><span class="icn">📋</span><h4>${dashTitle}</h4><div class="v">${my.length}</div></div><div class="st g"><span class="icn">📝</span><h4>Private</h4><div class="v">${pv.length}</div></div><div class="st o"><span class="icn">👥</span><h4>Group</h4><div class="v">${gr.length}</div></div><div class="st pu"><span class="icn">🏨</span><h4>Hotels</h4><div class="v" id="dashHotelCount">${Object.values(S.hotels).reduce((a,l)=>a+(l?.length||0),0)}</div></div></div>
+
+<div class="dash-viz-grid">
+  <!-- Total Quotations This Month Widget -->
+  <div class="dash-viz-card">
+    <div class="dash-viz-hdr">
+      <div class="dash-viz-title">📊 Total Quotations This Month</div>
+      <span class="bd bd-a" style="font-size:.65rem">${curMonthLabel}</span>
+    </div>
+    <div class="dash-viz-stat-row">
+      <div>
+        <div class="dash-viz-main-num">${thisMonthTotal} <span style="font-size:.85rem;font-weight:600;color:var(--t2)">quotes</span></div>
+        <div class="dash-viz-sub-num">PKR ${fmt(thisMonthAmount)} Total Quoted</div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+        <span class="dash-trend-pill ${trendClass}">${trendHtml}</span>
+        <span style="font-size:.64rem;color:var(--t2)">Pvt: <b>${thisMonthPvt}</b> • Grp: <b>${thisMonthGrp}</b></span>
+      </div>
+    </div>
+    <div class="dash-chart-container" id="dashMonthlyChart"></div>
+  </div>
+
+  <!-- Pending Approvals Widget -->
+  <div class="dash-viz-card">
+    <div class="dash-viz-hdr">
+      <div class="dash-viz-title">⏳ Quotation Approvals</div>
+      <span class="status-pill ${pendingCount>0?'pending':'approved'}">${pendingCount} Pending</span>
+    </div>
+    <div class="dash-donut-container">
+      <div class="dash-donut-svg-wrap">
+        <div id="dashApprovalChart" style="width:130px;height:130px"></div>
+        <div class="dash-donut-center-text">
+          <div class="dash-donut-pct">${approvalRate}%</div>
+          <div class="dash-donut-lbl">Approved</div>
+        </div>
+      </div>
+      <div class="dash-legend">
+        <div class="dash-legend-item">
+          <span><span class="dash-legend-dot" style="background:#f59e0b"></span>Pending:</span>
+          <b>${pendingCount} <span style="font-weight:500;font-size:.66rem;color:var(--t2)">(PKR ${fmt(pendingAmount)})</span></b>
+        </div>
+        <div class="dash-legend-item">
+          <span><span class="dash-legend-dot" style="background:#10b981"></span>Approved:</span>
+          <b>${approvedCount} <span style="font-weight:500;font-size:.66rem;color:var(--t2)">(PKR ${fmt(approvedAmount)})</span></b>
+        </div>
+        ${rejectedCount>0?`
+        <div class="dash-legend-item">
+          <span><span class="dash-legend-dot" style="background:#ef4444"></span>Rejected:</span>
+          <b>${rejectedCount}</b>
+        </div>`:''}
+      </div>
+    </div>
+    <div style="border-top:1px solid var(--bd);padding-top:8px">
+      <div style="font-size:.68rem;font-weight:700;color:var(--t2);text-transform:uppercase;margin-bottom:4px">Pending Review Queue</div>
+      ${pendingListHtml}
+    </div>
+  </div>
+</div>
+
 <div class="g2">
 <div class="cd"><div class="cd-h">🏆 Top Clients</div>${topClients.length?`<div class="top-clients">${topClients.map(([name,amt],i)=>`<div class="top-client-row"><div class="tc-rank">${i+1}</div><div class="tc-name">${_esc(name)}</div><div class="tc-amt">PKR ${fmt(amt)}</div></div>`).join("")}</div>`:`<p style="text-align:center;padding:12px;color:var(--t2);font-size:.78rem">No data yet</p>`}</div>
 <div class="cd"><div class="cd-h">Quick Actions</div><div style="display:flex;flex-direction:column;gap:5px">${P("quot","add")||P("pvt","add")?`<button class="btn btn-p" onclick="editKey=null;nav('pvt')" style="width:100%;justify-content:center">New Private Package</button>`:""}${P("quot","add")||P("grp","add")?`<button class="btn btn-a" onclick="editKey=null;nav('grp')" style="width:100%;justify-content:center">New Group Package</button>`:""}${P("quot","view")?`<button class="btn btn-o" onclick="nav('quot')" style="width:100%;justify-content:center">📋 My Quotations</button>`:""}${seeAll?`<button class="btn btn-o" onclick="nav('allquot')" style="width:100%;justify-content:center">🗂 All Quotations (Admin)</button>`:""}<button class="btn btn-o" onclick="nav('dup')" style="width:100%;justify-content:center">🔁 Duplicate Finder</button></div></div></div>
 <div class="cd" style="margin-top:10px"><div class="cd-h">Recent ${seeAll?"(All Users)":"(My)"}</div><div class="ql" id="dQ"></div></div>`;
+
+// Render D3 charts after DOM insertion
+setTimeout(()=>{
+  renderDashMonthlyTrendChart("dashMonthlyChart",trend6mData);
+  renderDashApprovalDonutChart("dashApprovalChart",statusData);
+},20);
+
 /* HOTEL COUNT LIVE UPDATE: hotels background mein load hoti hain — pehle
    dashboard 0 dikha deta tha. Ab jaise hi cities ki hotels aati hain count
    khud update ho jata hai. */
@@ -2753,10 +3504,10 @@ setTimeout(()=>{
     pg.insertBefore(alertDiv,pg.firstChild);
   }
 },100);
-const dq=$("dQ");my.slice(-6).reverse().forEach(([k,v])=>{const updNoteDash=v.updatedBy&&v.updatedBy!==v.createdBy?` • Updated by ${fullNameOf(v.updatedBy)}`:"";const ownerInfo=seeAll?` <span style="font-size:.62rem;background:#e0e7ff;color:#3730a3;padding:1px 5px;border-radius:8px">${fullNameOf(v.createdBy)||v.createdBy}</span>`:``;dq.innerHTML+=`<div class="qc"><div class="qi"><div class="qn">${_esc(v.clientName)||"—"} <span class="bd bd-${v.type==="group"?"a":"u"}">${v.type}</span>${ownerInfo}</div><div class="qm">${_esc(v.invoiceNo)||""} • ${fmtDT(v.createdAt)}${updNoteDash}</div></div><div class="qa">PKR ${fmt(v.totalAdult||0)}</div><div class="qb"><button class="btn-icon" onclick="viewQ('${k}')">👁</button><button class="btn-icon" style="color:var(--teal)" onclick="cloneQuotation('${k}')" title="Clone">📋</button></div></div>`});
+const dq=$("dQ");my.slice(-6).reverse().forEach(([k,v])=>{const updNoteDash=v.updatedBy&&v.updatedBy!==v.createdBy?` • Updated by ${fullNameOf(v.updatedBy)}`:"";const ownerInfo=seeAll?` <span style="font-size:.62rem;background:#e0e7ff;color:#3730a3;padding:1px 5px;border-radius:8px">${fullNameOf(v.createdBy)||v.createdBy}</span>`:``;const stVal=v.status||"pending";const stBadge=`<span class="status-pill ${stVal}">${stVal}</span>`;dq.innerHTML+=`<div class="qc"><div class="qi"><div class="qn">${_esc(v.clientName)||"—"} <span class="bd bd-${v.type==="group"?"a":"u"}">${v.type}</span> ${stBadge}${ownerInfo}</div><div class="qm">${_esc(v.invoiceNo)||""} • ${fmtDT(v.createdAt)}${updNoteDash}</div></div><div class="qa">PKR ${fmt(v.totalAdult||0)}</div><div class="qb"><button class="btn-icon" onclick="viewQ('${k}')">👁</button><button class="btn-icon" style="color:var(--teal)" onclick="cloneQuotation('${k}')" title="Clone">📋</button></div></div>`});
 if(!my.length)dq.innerHTML=`<p style="text-align:center;padding:16px;color:var(--t2)">No quotations yet</p>`}
 
-function pgPvt(pg){const roeDef=S.settings?.defaultROE||78;pg.innerHTML=`<div class="cd"><div class="cd-h">Private Package <span id="pEditTag"></span><div style="display:flex;gap:5px;flex-wrap:wrap"><button class="btn btn-o btn-sm" id="pCancelEditBtn" onclick="cancelEdit('pvt')">Cancel</button> <button class="btn btn-o btn-sm" onclick="pPreview()">Preview</button> <button class="btn btn-sm" style="background:#25D366;color:#fff" onclick="shareWhatsAppPvt()">📱 WhatsApp</button> <button class="btn btn-sm" style="background:#7c3aed;color:#fff" onclick="printCostingPvt()">🖨 Print Costing</button> <button class="btn btn-a btn-sm" id="pSaveBtn" onclick="pSave()">Save & Print</button></div></div>
+function pgPvt(pg){const roeDef=S.settings?.defaultROE||78;pg.innerHTML=`<div class="cd"><div class="cd-h">Private Package <span id="pEditTag"></span><div style="display:flex;gap:5px;flex-wrap:wrap"><button class="btn btn-o btn-sm" id="pCancelEditBtn" onclick="cancelEdit('pvt')">Cancel</button> <button class="btn btn-o btn-sm" onclick="saveQuotationDraftShortcut('pvt')" title="Save Draft (Ctrl + S)">💾 Save Draft</button> <button class="btn btn-o btn-sm" onclick="pPreview()" title="Print Preview (Ctrl + P)">Preview</button> <button class="btn btn-sm" style="background:#25D366;color:#fff" onclick="shareWhatsAppPvt()">📱 WhatsApp</button> <button class="btn btn-sm" style="background:#7c3aed;color:#fff" onclick="printCostingPvt()">🖨 Print Costing</button> <button class="btn btn-a btn-sm" id="pSaveBtn" onclick="pSave()" title="Save & Print (Ctrl + Enter)">Save & Print</button></div></div>
 <div class="g4"><div class="fg"><label>Client Name</label><input id="pN"></div><div class="fg"><label>Contact</label><input id="pPh"></div><div class="fg"><label>Travel Dates</label><input id="pDt"></div><div class="fg"><label>Default ROE</label><input type="number" id="pROE" value="${roeDef}" oninput="triggerCalc()"></div><div class="fg gf"><label>PKG Includes</label><input id="pInc" value="FLIGHT, HOTEL, VISA, TRANSPORT"></div></div></div>
 <div class="tabs" id="pTabs"><div class="tab on" onclick="pTab('A')">Option A</div><div class="tab" onclick="pTab('B')">Option B</div><div class="tab" onclick="pTab('C')">Option C</div></div><div id="pTP"></div>`;
 ['A','B','C'].forEach(l=>bOpt(l));pTab('A');attachAutoCalc();_syncTravelDatesFromFlights();checkDraftBanner('pvt')}
@@ -3010,7 +3761,7 @@ data.totalAdult=Object.values(data.options)[0]?.perAdult||0;
 printPvt(data);
 };
 
-function pgGrp(pg){pg.innerHTML=`<div class="cd"><div class="cd-h">Group Package <span id="gEditTag"></span><div style="display:flex;gap:5px;flex-wrap:wrap"><button class="btn btn-o btn-sm" id="gCancelEditBtn" onclick="cancelEdit('grp')">Cancel</button> <button class="btn btn-o btn-sm" onclick="gPreview()">Preview</button> <button class="btn btn-sm" style="background:#25D366;color:#fff" onclick="shareWhatsAppGrp()">📱 WhatsApp</button> <button class="btn btn-sm" style="background:#7c3aed;color:#fff" onclick="printCostingGrp()">🖨 Print Costing</button> <button class="btn btn-a btn-sm" id="gSaveBtn" onclick="gSave()">Save & Print</button></div></div><div class="g3"><div class="fg"><label>Client</label><input id="gN"></div><div class="fg"><label>PKG Includes</label><input id="gInc" value="FLIGHT, HOTEL, VISA, TRANSPORT"></div><div class="fg"><label>Travel Dates</label><input id="gDt"></div><div class="fg gf"><label>Heading</label><input id="gHd"></div><div class="fg"><label>Airline</label><select id="gAir">${so(S.airlines)}</select></div><div class="fg"><label>Ticket/Person PKR</label><input type="number" id="gTk" value="0"></div><div class="fg"><label>Total Days</label><input type="number" id="gDays" placeholder="Auto" oninput="this.dataset.manual='1'"></div></div></div>
+function pgGrp(pg){pg.innerHTML=`<div class="cd"><div class="cd-h">Group Package <span id="gEditTag"></span><div style="display:flex;gap:5px;flex-wrap:wrap"><button class="btn btn-o btn-sm" id="gCancelEditBtn" onclick="cancelEdit('grp')">Cancel</button> <button class="btn btn-o btn-sm" onclick="saveQuotationDraftShortcut('grp')" title="Save Draft (Ctrl + S)">💾 Save Draft</button> <button class="btn btn-o btn-sm" onclick="gPreview()" title="Print Preview (Ctrl + P)">Preview</button> <button class="btn btn-sm" style="background:#25D366;color:#fff" onclick="shareWhatsAppGrp()">📱 WhatsApp</button> <button class="btn btn-sm" style="background:#7c3aed;color:#fff" onclick="printCostingGrp()">🖨 Print Costing</button> <button class="btn btn-a btn-sm" id="gSaveBtn" onclick="gSave()" title="Save & Print (Ctrl + Enter)">Save & Print</button></div></div><div class="g3"><div class="fg"><label>Client</label><input id="gN"></div><div class="fg"><label>PKG Includes</label><input id="gInc" value="FLIGHT, HOTEL, VISA, TRANSPORT"></div><div class="fg"><label>Travel Dates</label><input id="gDt"></div><div class="fg gf"><label>Heading</label><input id="gHd"></div><div class="fg"><label>Airline</label><select id="gAir">${so(S.airlines)}</select></div><div class="fg"><label>Ticket/Person PKR</label><input type="number" id="gTk" value="0"></div><div class="fg"><label>Total Days</label><input type="number" id="gDays" placeholder="Auto" oninput="this.dataset.manual='1'"></div></div></div>
 <div class="cd"><div class="sec-hd sec-hotel">HOTELS</div><div class="tw"><table><thead><tr><th style="width:80px">City</th><th style="min-width:180px">Hotel</th><th style="width:80px">Cat</th><th style="width:60px">Rate</th><th style="width:45px">Qty</th><th style="width:75px">Dist</th><th style="width:45px">Ngts</th><th style="width:60px">ROE</th><th>Total</th></tr></thead><tbody id="gHBody">${[0,1,2,3,4,5].map(i=>`<tr class="tr-hotel${i>1?" xrow":""}"${i>1?` style="display:none"`:""}><td class="label-cell" data-label="City"><select id="gHCity${i}" onchange="if(this.value==='__newcity__'){addNewCityInline(this)}else{fH('gH${i}','gH${i}d','gHCity${i}','gHD${i}')}">${cityOptionsHtml(i%2===0?"makkah":"madina")}</select></td><td data-label="Hotel">${hi(`gH${i}`,`gHCity${i}`,`gHD${i}`)}</td><td data-label="Cat"><select id="gHC${i}">${so(S.rooms)}</select></td><td data-label="Rate"><input type="number" id="gHR${i}"></td><td data-label="Qty"><input type="number" id="gHQ${i}" value="${i<2?1:0}"></td><td data-label="Dist"><input id="gHD${i}" readonly></td><td data-label="Ngts"><input type="number" id="gHN${i}"></td><td data-label="ROE"><input type="number" id="gHE${i}" value="77"></td><td data-label="Total" id="gHT${i}" class="ro"></td></tr>`).join("")}</tbody></table></div><button class="btn btn-o btn-sm add-row-btn" onclick="addTblRow('gHBody')">+ Add Hotel Row</button>
 <div class="sec-hd sec-visa">VISA</div><div class="g4" style="margin-bottom:6px"><div class="fg"><label>Visa SAR</label><input type="number" id="gVR" value="560"></div><div class="fg"><label>Qty</label><input type="number" id="gVQ" value="5"></div><div class="fg"><label>ROE</label><input type="number" id="gVE" value="77"></div><div class="fg"><label>Per Person</label><input id="gVPP" readonly class="ro"></div></div>
 <div class="sec-hd sec-trans">TRANSPORT</div><div class="tw"><table><thead><tr><th style="min-width:160px">Sector / Type</th><th style="min-width:150px">Vehicle</th><th style="width:60px">Rate</th><th style="width:45px">Qty</th><th style="width:50px">ROE</th><th>Total</th></tr></thead><tbody id="gTBody">${[0,1,2,3,4,5].map(i=>`<tr class="tr-trans${i>1?" xrow":""}"${i>1?` style="display:none"`:""}><td data-label="Sector">${trAcInput(`gTS${i}`,"","sector")}</td><td data-label="Vehicle">${trAcInput(`gTV${i}`,"","vehicle")}</td><td data-label="Rate"><input type="number" id="gTR${i}"></td><td data-label="Qty"><input type="number" id="gTQ${i}" value="0"></td><td data-label="ROE"><input type="number" id="gTE${i}" value="77"></td><td data-label="Total" id="gTT${i}" class="ro"></td></tr>`).join("")}</tbody></table></div><button class="btn btn-o btn-sm add-row-btn" onclick="addTblRow('gTBody')">+ Add Transport Row</button></div>
@@ -3054,31 +3805,157 @@ d.totalAdult=n($("gS4")?.textContent?.replace(/,/g,""))||0;
 printGrp(d);
 };
 
+let _selQuotOwn=new Set();
+let _selQuotAll=new Set();
+
+function _updateQuotSelectionUI(scope){
+  const isOwn=scope==="own";
+  const selSet=isOwn?_selQuotOwn:_selQuotAll;
+  // Clean up any keys that don't exist anymore
+  for(const k of Array.from(selSet)){if(!S.quotations||!S.quotations[k])selSet.delete(k)}
+  const count=selSet.size;
+
+  document.querySelectorAll(isOwn?".bdel-count-own":".bdel-count-all").forEach(el=>{el.textContent=count});
+  const countLabel=$(isOwn?"qSelCountOwn":"qSelCountAll");
+  if(countLabel){
+    countLabel.textContent=count>0?`${count} selected`:"0 selected";
+    countLabel.style.fontWeight=count>0?"700":"400";
+    countLabel.style.color=count>0?"var(--p)":"var(--t2)";
+  }
+  const bulkBtn=$(isOwn?"qBulkDelOwn":"qBulkDelAll");
+  if(bulkBtn)bulkBtn.style.display=count>0?"inline-flex":"none";
+  const topBulkBtn=$(isOwn?"qBulkDelTopOwn":"qBulkDelTopAll");
+  if(topBulkBtn)topBulkBtn.style.display=count>0?"inline-flex":"none";
+
+  const chks=document.querySelectorAll(isOwn?".q-chk-own":".q-chk-all");
+  const selAllChk=$(isOwn?"qSelAllOwn":"qSelAllAdmin");
+  if(selAllChk&&chks.length>0){
+    let checkedCount=0;
+    chks.forEach(c=>{if(c.checked)checkedCount++});
+    selAllChk.checked=checkedCount===chks.length&&chks.length>0;
+    selAllChk.indeterminate=checkedCount>0&&checkedCount<chks.length;
+  }else if(selAllChk){
+    selAllChk.checked=false;
+    selAllChk.indeterminate=false;
+  }
+}
+
+window.onQuotChkChange=(scope,key,isChecked)=>{
+  const isOwn=scope==="own";
+  const selSet=isOwn?_selQuotOwn:_selQuotAll;
+  if(isChecked)selSet.add(key);else selSet.delete(key);
+  const row=$(isOwn?`qc_own_${key}`:`qc_all_${key}`);
+  if(row){
+    if(isChecked)row.classList.add("qc-selected");
+    else row.classList.remove("qc-selected");
+  }
+  _updateQuotSelectionUI(scope);
+};
+
+window.toggleSelectAllQuot=(scope,isChecked)=>{
+  const isOwn=scope==="own";
+  const selSet=isOwn?_selQuotOwn:_selQuotAll;
+  const chks=document.querySelectorAll(isOwn?".q-chk-own":".q-chk-all");
+  chks.forEach(chk=>{
+    chk.checked=isChecked;
+    const k=chk.dataset.key;
+    if(k){
+      if(isChecked)selSet.add(k);
+      else selSet.delete(k);
+      const row=$(isOwn?`qc_own_${k}`:`qc_all_${k}`);
+      if(row){
+        if(isChecked)row.classList.add("qc-selected");
+        else row.classList.remove("qc-selected");
+      }
+    }
+  });
+  _updateQuotSelectionUI(scope);
+};
+
+window.bulkDeleteQuot=async(scope)=>{
+  const isOwn=scope==="own";
+  if(isOwn&&!P("quot","delete"))return toast("You don't have delete permission","err");
+  if(!isOwn&&!P("allquot","delete"))return toast("You don't have All Quotations delete permission","err");
+
+  const selSet=isOwn?_selQuotOwn:_selQuotAll;
+  const validKeys=Array.from(selSet).filter(k=>S.quotations&&S.quotations[k]);
+  if(!validKeys.length)return toast("No quotations selected","warn");
+
+  if(isOwn){
+    const notOwn=validKeys.some(k=>S.quotations[k].createdBy!==S.user.u);
+    if(notOwn)return toast("You can only delete your own quotations","err");
+  }
+
+  confirmModal(`Permanently delete <b>${validKeys.length}</b> selected quotation${validKeys.length>1?"s":""}? (They will stay in Recycle Bin for 7 days)`,async()=>{
+    toast(`Deleting ${validKeys.length} quotation(s)...`);
+    let deletedCount=0;
+    try{
+      for(const k of validKeys){
+        const v=S.quotations[k];
+        if(v){
+          try{
+            await _trashAdd("quotation",(v.invoiceNo||"Quotation")+" — "+(v.clientName||""),v.type==="group"?"Group":"Private","quotations/"+k,v,{});
+            await bFD("quotations/"+k);
+            delete S.quotations[k];
+            deletedCount++;
+          }catch(e){
+            console.warn("Delete quotation failed for key "+k,e.message);
+          }
+        }
+      }
+      selSet.clear();
+      toast(`Deleted ${deletedCount} quotation(s) — Moved to Recycle Bin`);
+      if(isOwn)await rQLCore();
+      else await rQLAllCore();
+    }catch(ex){
+      toast("Bulk delete failed: "+ex.message,"err");
+    }
+  },`Yes, Delete (${validKeys.length})`,"btn-d");
+};
+
 function pgQuot(pg){if(!P("quot","view"))return pg.innerHTML=`<div class="cd"><div class="cd-h">My Quotations</div><p style="padding:20px;color:var(--t2);text-align:center">Access not allowed</p></div>`;
 const canAdd=P("quot","add");
-pg.innerHTML=`<div class="cd"><div class="cd-h">My Quotations <div style="display:flex;gap:6px;flex-wrap:wrap">${canAdd?`<button class="btn btn-sm btn-p" onclick="editKey=null;nav('pvt')">+ Private</button><button class="btn btn-sm btn-a" onclick="editKey=null;nav('grp')">+ Group</button>`:""}<button class="btn btn-sm btn-o" onclick="rQL()">Refresh</button><button class="btn btn-sm btn-g" onclick="exportQuotCSV(v=>v.createdBy===S.user.u,'My_Quotations')">⬇ Export</button></div></div><div class="ql" id="qL"><p style="text-align:center;padding:20px;color:var(--t2)">⏳ Loading quotations...</p></div></div>`;rQLCore()}
-/* BUG FIX: pehle is function ka naam bhi rQL tha aur neeche window.rQL wrapper
-   se overwrite ho jata tha — har call infinite recursion mein ja kar
-   "Maximum call stack size exceeded" deti thi aur list hamesha "Loading" rehti.
-   Ab core function ka naam rQLCore hai, wrapper alag hai. */
+pg.innerHTML=`<div class="cd"><div class="cd-h" style="flex-wrap:wrap;gap:8px"><span>My Quotations</span> <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${canAdd?`<button class="btn btn-sm btn-p" onclick="editKey=null;nav('pvt')">+ Private</button><button class="btn btn-sm btn-a" onclick="editKey=null;nav('grp')">+ Group</button>`:""}<button id="qBulkDelTopOwn" class="btn btn-sm btn-d" style="display:none" onclick="bulkDeleteQuot('own')">🗑 Bulk Delete (<span class="bdel-count-own">0</span>)</button><button class="btn btn-sm btn-o" onclick="rQL()">Refresh</button><button class="btn btn-sm btn-g" onclick="exportQuotCSV(v=>v.createdBy===S.user.u,'My_Quotations')">⬇ Export</button></div></div>
+<div id="qSelBarOwn" class="q-sel-bar" style="display:none">
+  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-weight:600;color:var(--t)">
+    <input type="checkbox" id="qSelAllOwn" style="width:16px;height:16px;cursor:pointer;accent-color:var(--p)" onchange="toggleSelectAllQuot('own',this.checked)"> Select All
+  </label>
+  <div style="display:flex;align-items:center;gap:10px">
+    <span id="qSelCountOwn" style="color:var(--t2);font-size:.74rem">0 selected</span>
+    <button id="qBulkDelOwn" class="btn btn-sm btn-d" style="display:none" onclick="bulkDeleteQuot('own')">🗑 Bulk Delete (<span class="bdel-count-own">0</span>)</button>
+  </div>
+</div>
+<div class="ql" id="qL"><p style="text-align:center;padding:20px;color:var(--t2)">⏳ Loading quotations...</p></div></div>`;rQLCore()}
+
 async function rQLCore(){const l=$("qL");
-/* SPEED: agar quotations pehle se memory mein hon (boot/loadData se) to FORAN
-   dikha do — 5MB fetch ka intezar nahi. Fetch background mein update karti hai. */
 const _render=()=>{if(!l)return;l.innerHTML="";
-/* My Quotations — sirf apne hi quotations dikhain */
 let en=Object.entries(S.quotations);
 let fl=en.filter(([k,v])=>v&&v.createdBy===S.user.u);
-/* Branch filter removed: My Quotations mein apne SAARE quotations dikhne chahiye,
-   chahe kisi bhi branch ke hon — warna branch change hone par quotations
-   "ghayab" ho jate hain. Branch badge already har quotation pe dikhai deta hai. */
 console.log("[rQL] Filter:",fl.length,"of",en.length,"quotations belong to",S.user.u);
-if(!fl.length){const otherUsers=en.filter(([k,v])=>v&&v.createdBy!==S.user.u);l.innerHTML=`<p style="text-align:center;padding:20px;color:var(--t2)">No quotations found for <b>${_esc(S.user.u)}</b>.</p><p style="text-align:center;font-size:.72rem;color:var(--t2)">Total in system: ${en.length} quotation(s)${otherUsers.length?" ("+otherUsers.length+" by other users — check All Quotations)":""}</p><div style="text-align:center;margin-top:10px"><button class="btn btn-sm btn-o" onclick="rQL()">🔄 Retry Loading</button></div>`;return}
-fl.reverse().forEach(([k,v])=>{const updNote=v.updatedBy&&v.updatedBy!==v.createdBy?` <span style="color:var(--t2);font-size:.62rem">• Updated by ${fullNameOf(v.updatedBy)}</span>`:"";const isGrp=v.type==="group";
-const branchBadge=v.branchName?` <span style="font-size:.63rem;background:#d1fae5;color:#065f46;padding:1px 5px;border-radius:8px;font-weight:600">🏢 ${_esc(v.branchName)}</span>`:"";
-/* My Quotations mein: sirf apne edit/delete kar sakte hain — quot permissions se */
-const canEdit=P("quot","edit");
-const canDel=P("quot","delete");
-l.innerHTML+=`<div class="qc"><div class="qi"><div class="qn">${_esc(v.clientName)||"—"} <span class="bd bd-${isGrp?"a":"u"}">${v.type}</span>${branchBadge}</div><div class="qm">${_esc(v.invoiceNo)||""} • ${fmtDT(v.createdAt)}${updNote}</div></div><div class="qa">PKR ${fmt(v.totalAdult||0)}</div><div class="qb"><button class="btn-icon" onclick="viewQ('${k}')">👁</button><button class="btn-icon" style="color:#25D366" onclick="shareWhatsAppFromList('${k}')" title="Share to WhatsApp">📱</button><button class="btn-icon" style="color:var(--teal)" onclick="cloneQuotation('${k}')" title="Clone">📋</button>${canEdit?`<button class="btn-icon" style="color:var(--p)" onclick="editQOwn('${k}')">✏</button>`:""}${canDel?`<button class="btn-icon" style="color:var(--er)" onclick="delQOwn('${k}')">🗑</button>`:""}</div></div>`})};
+const selBar=$("qSelBarOwn");
+if(!fl.length){
+  if(selBar)selBar.style.display="none";
+  _selQuotOwn.clear();
+  _updateQuotSelectionUI("own");
+  const otherUsers=en.filter(([k,v])=>v&&v.createdBy!==S.user.u);
+  l.innerHTML=`<p style="text-align:center;padding:20px;color:var(--t2)">No quotations found for <b>${_esc(S.user.u)}</b>.</p><p style="text-align:center;font-size:.72rem;color:var(--t2)">Total in system: ${en.length} quotation(s)${otherUsers.length?" ("+otherUsers.length+" by other users — check All Quotations)":""}</p><div style="text-align:center;margin-top:10px"><button class="btn btn-sm btn-o" onclick="rQL()">🔄 Retry Loading</button></div>`;
+  return;
+}
+if(selBar)selBar.style.display="flex";
+fl.reverse().forEach(([k,v])=>{
+  const updNote=v.updatedBy&&v.updatedBy!==v.createdBy?` <span style="color:var(--t2);font-size:.62rem">• Updated by ${fullNameOf(v.updatedBy)}</span>`:"";
+  const isGrp=v.type==="group";
+  const branchBadge=v.branchName?` <span style="font-size:.63rem;background:#d1fae5;color:#065f46;padding:1px 5px;border-radius:8px;font-weight:600">🏢 ${_esc(v.branchName)}</span>`:"";
+  const canEdit=P("quot","edit");
+  const canDel=P("quot","delete");
+  const isSelected=_selQuotOwn.has(k);
+  const stVal=v.status||"pending";
+  const stBadge=`<span class="status-pill ${stVal}">${stVal}</span>`;
+  const chkHtml=canDel?`<input type="checkbox" class="q-row-chk q-chk-own" data-key="${k}" ${isSelected?"checked":""} onchange="onQuotChkChange('own','${k}',this.checked)" onclick="event.stopPropagation()" title="Select quotation" style="width:16px;height:16px;cursor:pointer;flex-shrink:0">`:"";
+  l.innerHTML+=`<div class="qc ${isSelected?"qc-selected":""}" id="qc_own_${k}">${chkHtml}<div class="qi"><div class="qn">${_esc(v.clientName)||"—"} <span class="bd bd-${isGrp?"a":"u"}">${v.type}</span> ${stBadge}${branchBadge}</div><div class="qm">${_esc(v.invoiceNo)||""} • ${fmtDT(v.createdAt)}${updNote}</div></div><div class="qa">PKR ${fmt(v.totalAdult||0)}</div><div class="qb"><button class="btn-icon" onclick="viewQ('${k}')">👁</button><button class="btn-icon" style="color:#25D366" onclick="shareWhatsAppFromList('${k}')" title="Share to WhatsApp">📱</button><button class="btn-icon" style="color:var(--teal)" onclick="cloneQuotation('${k}')" title="Clone">📋</button>${canEdit?`<button class="btn-icon" style="color:var(--p)" onclick="editQOwn('${k}')">✏</button>`:""}${canDel?`<button class="btn-icon" style="color:var(--er)" onclick="delQOwn('${k}')">🗑</button>`:""}</div></div>`;
+});
+_updateQuotSelectionUI("own");
+};
 const _hadData=S.quotations&&Object.keys(S.quotations).length>0;
 if(_hadData)_render();else if(l)l.innerHTML=`<p style="text-align:center;padding:20px;color:var(--t2)">⏳ Loading quotations...</p>`;
 try{const fetched=await wt(sbRpc("db_read",{p:"quotations"}),30000);if(fetched&&typeof fetched==="object")S.quotations=fetched;else if(!fetched)S.quotations={};console.log("[rQL] Fetched",Object.keys(S.quotations).length,"quotations")}catch(e){console.warn("[rQL] Fetch failed:",e.message);if(!(S.quotations&&Object.keys(S.quotations).length))toast("Could not load quotations: "+e.message+" — showing cached data","err")}
@@ -3086,26 +3963,45 @@ _render()}
 window.rQL=async()=>{await rQLCore();toast("Refreshed")};
 /* My Quotations ke liye alag edit/delete — sirf apne quotations pe kaam karta hai */
 window.editQOwn=k=>{const q=S.quotations[k];if(!q)return;if(q.createdBy!==S.user.u){toast("You can only edit your own quotations","err");return}if(!P("quot","edit")){toast("You don't have edit permission","err");return}if(q.type==="group"){nav("grp");editKey=k;_quoteOpenedTs=Date.now();loadGrpForm(q)}else{nav("pvt");editKey=k;_quoteOpenedTs=Date.now();loadPvtForm(q)}};
-window.delQOwn=async k=>{const v=S.quotations[k];if(!v){toast("Quotation not found","err");return}if(v.createdBy!==S.user.u){toast("You can only delete your own quotations","err");return}if(!P("quot","delete")){toast("You don't have delete permission","err");return}confirmModal("Delete this quotation? (Stays in Recycle Bin for 7 days)",async()=>{await _trashAdd("quotation",(v.invoiceNo||"Quotation")+" — "+(v.clientName||""),v.type==="group"?"Group":"Private","quotations/"+k,v,{});FD("quotations/"+k).then(()=>{delete S.quotations[k];rQLCore();toast("Deleted — Moved to Recycle Bin")}).catch(e=>toast("Delete failed: "+e.message,"err"))});};
+window.delQOwn=async k=>{const v=S.quotations[k];if(!v){toast("Quotation not found","err");return}if(v.createdBy!==S.user.u){toast("You can only delete your own quotations","err");return}if(!P("quot","delete")){toast("You don't have delete permission","err");return}confirmModal("Delete this quotation? (Stays in Recycle Bin for 7 days)",async()=>{await _trashAdd("quotation",(v.invoiceNo||"Quotation")+" — "+(v.clientName||""),v.type==="group"?"Group":"Private","quotations/"+k,v,{});FD("quotations/"+k).then(()=>{delete S.quotations[k];_selQuotOwn.delete(k);_selQuotAll.delete(k);rQLCore();toast("Deleted — Moved to Recycle Bin")}).catch(e=>toast("Delete failed: "+e.message,"err"))});};
 
 function pgAllQuot(pg){
 /* All Quotations — sirf admin/superadmin ke liye */
 if(!P("allquot","view"))return pg.innerHTML=`<div class="cd"><div class="cd-h">All Quotations</div><p style="padding:20px;color:var(--t2);text-align:center">⛔ Access not allowed — Admins only</p></div>`;
 const userOpts=Object.values(S.users||{}).sort((a,b)=>(a.full||a.u).localeCompare(b.full||b.u)).map(u=>`<option value="${_esc(u.u)}">${_esc(u.full||u.u)} (${u.r})</option>`).join("");
 const branchOpts=Object.entries(S.branches||{}).map(([id,b])=>`<option value="${id}">${b.name}</option>`).join("");
-pg.innerHTML=`<div class="cd"><div class="cd-h">All Quotations <span class="bd bd-a" style="font-size:.65rem">Admin View</span> <div style="display:flex;gap:6px;flex-wrap:wrap">${P("allquot","add")?`<button class="btn btn-sm btn-p" onclick="editKey=null;nav('pvt')">+ Private</button><button class="btn btn-sm btn-a" onclick="editKey=null;nav('grp')">+ Group</button>`:""}<button class="btn btn-sm btn-o" onclick="rQLAll()">Refresh</button><button class="btn btn-sm btn-g" onclick="exportAllQuotFiltered()">⬇ Export</button></div></div>
-<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+pg.innerHTML=`<div class="cd"><div class="cd-h" style="flex-wrap:wrap;gap:8px"><span>All Quotations <span class="bd bd-a" style="font-size:.65rem">Admin View</span></span> <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${P("allquot","add")?`<button class="btn btn-sm btn-p" onclick="editKey=null;nav('pvt')">+ Private</button><button class="btn btn-sm btn-a" onclick="editKey=null;nav('grp')">+ Group</button>`:""}<button id="qBulkDelTopAll" class="btn btn-sm btn-d" style="display:none" onclick="bulkDeleteQuot('all')">🗑 Bulk Delete (<span class="bdel-count-all">0</span>)</button><button class="btn btn-sm btn-o" onclick="rQLAll()">Refresh</button><button class="btn btn-sm btn-g" onclick="exportAllQuotFiltered()">⬇ Export</button></div></div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
 <div class="fg" style="max-width:200px;margin-bottom:0"><label>Filter by Branch</label><select id="qAllBranchFilter" onchange="applyAllQuotFilter()"><option value="">All Branches</option>${branchOpts}</select></div>
 <div class="fg" style="max-width:220px;margin-bottom:0"><label>Filter by User</label><select id="qAllUserFilter" onchange="applyAllQuotFilter()"><option value="">All Users</option>${userOpts}</select></div>
 <div class="fg" style="max-width:150px;margin-bottom:0"><label>Filter by Type</label><select id="qAllTypeFilter" onchange="applyAllQuotFilter()"><option value="">All Types</option><option value="group">Group</option><option value="private">Private</option></select></div>
 </div>
-<div id="qAllStats" style="font-size:.72rem;color:var(--t2);margin-bottom:8px"></div>
+<div id="qSelBarAll" class="q-sel-bar" style="display:none">
+  <div style="display:flex;align-items:center;gap:10px">
+    <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-weight:600;color:var(--t)">
+      <input type="checkbox" id="qSelAllAdmin" style="width:16px;height:16px;cursor:pointer;accent-color:var(--p)" onchange="toggleSelectAllQuot('all',this.checked)"> Select All
+    </label>
+    <div id="qAllStats" style="font-size:.72rem;color:var(--t2)"></div>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <span id="qSelCountAll" style="color:var(--t2);font-size:.74rem">0 selected</span>
+    <button id="qBulkDelAll" class="btn btn-sm btn-d" style="display:none" onclick="bulkDeleteQuot('all')">🗑 Bulk Delete (<span class="bdel-count-all">0</span>)</button>
+  </div>
+</div>
 <div class="ql" id="qLAll"></div></div>`;rQLAllCore()}
 async function rQLAllCore(){
 /* SPEED: memory mein data ho to foran paint karo, fresh fetch background mein */
 const _paintAll=()=>{const l=$("qLAll");if(!l)return;l.innerHTML="";const fUser=$("qAllUserFilter")?.value||"";const fType=$("qAllTypeFilter")?.value||"";const fBranch=$("qAllBranchFilter")?.value||"";let en=Object.entries(S.quotations);if(fBranch)en=en.filter(([k,v])=>v.branchId===fBranch);if(fUser)en=en.filter(([k,v])=>v.createdBy===fUser);if(fType)en=en.filter(([k,v])=>(fType==="group"?v.type==="group":v.type!=="group"));
 const stats=$("qAllStats");if(stats)stats.textContent=`Total: ${en.length} quotation(s) shown`;
-if(!en.length){l.innerHTML=`<p style="text-align:center;padding:20px;color:var(--t2)">No quotations found</p>`;return}
+const selBar=$("qSelBarAll");
+if(!en.length){
+  if(selBar)selBar.style.display="none";
+  _selQuotAll.clear();
+  _updateQuotSelectionUI("all");
+  l.innerHTML=`<p style="text-align:center;padding:20px;color:var(--t2)">No quotations found</p>`;
+  return;
+}
+if(selBar)selBar.style.display="flex";
 en.reverse().forEach(([k,v])=>{
 /* All Quotations admin panel mein: allquot permissions se edit/delete */
 const canEdit=P("allquot","edit");
@@ -3113,7 +4009,14 @@ const canDel=P("allquot","delete");
 const updNoteAll=v.updatedBy&&v.updatedBy!==v.createdBy?` <span style="color:var(--t2);font-size:.62rem">• Updated by ${fullNameOf(v.updatedBy)}</span>`:"";
 const ownerBadge=`<span style="font-size:.63rem;background:#e0e7ff;color:#3730a3;padding:1px 5px;border-radius:8px;font-weight:600">${fullNameOf(v.createdBy)||v.createdBy}</span>`;
 const branchBadge=v.branchName?`<span style="font-size:.63rem;background:#d1fae5;color:#065f46;padding:1px 5px;border-radius:8px;font-weight:600">🏢 ${v.branchName}</span>`:"";
-l.innerHTML+=`<div class="qc"><div class="qi"><div class="qn">${_esc(v.clientName)||"—"} <span class="bd bd-${v.type==="group"?"a":"u"}">${v.type}</span> ${ownerBadge} ${branchBadge}</div><div class="qm">${_esc(v.invoiceNo)||""} • ${fmtDT(v.createdAt)}${updNoteAll}</div></div><div class="qa">PKR ${fmt(v.totalAdult||0)}</div><div class="qb"><button class="btn-icon" onclick="viewQ('${k}')">👁</button><button class="btn-icon" style="color:#25D366" onclick="shareWhatsAppFromList('${k}')" title="Share to WhatsApp">📱</button><button class="btn-icon" style="color:var(--teal)" onclick="cloneQuotation('${k}')" title="Clone">📋</button>${canEdit?`<button class="btn-icon" style="color:var(--p)" onclick="editQ('${k}')">✏</button>`:""}${canDel?`<button class="btn-icon" style="color:var(--er)" onclick="delQ('${k}')">🗑</button>`:""}</div></div>`})};
+const isSelected=_selQuotAll.has(k);
+const stVal=v.status||"pending";
+const stBadge=`<span class="status-pill ${stVal}">${stVal}</span>`;
+const chkHtml=canDel?`<input type="checkbox" class="q-row-chk q-chk-all" data-key="${k}" ${isSelected?"checked":""} onchange="onQuotChkChange('all','${k}',this.checked)" onclick="event.stopPropagation()" title="Select quotation" style="width:16px;height:16px;cursor:pointer;flex-shrink:0">`:"";
+l.innerHTML+=`<div class="qc ${isSelected?"qc-selected":""}" id="qc_all_${k}">${chkHtml}<div class="qi"><div class="qn">${_esc(v.clientName)||"—"} <span class="bd bd-${v.type==="group"?"a":"u"}">${v.type}</span> ${stBadge} ${ownerBadge} ${branchBadge}</div><div class="qm">${_esc(v.invoiceNo)||""} • ${fmtDT(v.createdAt)}${updNoteAll}</div></div><div class="qa">PKR ${fmt(v.totalAdult||0)}</div><div class="qb"><button class="btn-icon" onclick="viewQ('${k}')">👁</button><button class="btn-icon" style="color:#25D366" onclick="shareWhatsAppFromList('${k}')" title="Share to WhatsApp">📱</button><button class="btn-icon" style="color:var(--teal)" onclick="cloneQuotation('${k}')" title="Clone">📋</button>${canEdit?`<button class="btn-icon" style="color:var(--p)" onclick="editQ('${k}')">✏</button>`:""}${canDel?`<button class="btn-icon" style="color:var(--er)" onclick="delQ('${k}')">🗑</button>`:""}</div></div>`;
+});
+_updateQuotSelectionUI("all");
+};
 const _hadAll=S.quotations&&Object.keys(S.quotations).length>0;
 if(_hadAll)_paintAll();else{const l=$("qLAll");if(l)l.innerHTML=`<p style="text-align:center;padding:20px;color:var(--t2)">⏳ Loading quotations...</p>`}
 try{const fetched=await wt(sbRpc("db_read",{p:"quotations"}),30000);if(fetched&&typeof fetched==="object")S.quotations=fetched}catch(e){console.warn("[rQLAll] Fetch failed:",e.message)}
@@ -3126,7 +4029,7 @@ window.editQ=k=>{const q=S.quotations[k];if(!q)return;if(!P("allquot","edit")){t
 if(q.type==="group"){nav("grp");editKey=k;_quoteOpenedTs=Date.now();loadGrpForm(q)}else{nav("pvt");editKey=k;_quoteOpenedTs=Date.now();loadPvtForm(q)}};
 window.cancelEdit=kind=>{const wasEditing=!!editKey;const msg=wasEditing?"Discard unsaved changes and cancel edit?":"Clear this form?";confirmModal(msg,()=>{editKey=null;clearDraft(kind);nav(kind);toast(wasEditing?"Edit cancelled":"Form cleared")},"Yes","btn-o")};
 /* delQ — All Quotations (admin panel) se use hota hai */
-window.delQ=async k=>{const v=S.quotations[k];if(!v){toast("Quotation not found","err");return}if(!P("allquot","delete")){toast("You don't have All Quotations delete permission","err");return}confirmModal("Delete this quotation? (Stays in Recycle Bin for 7 days)",async()=>{await _trashAdd("quotation",(v.invoiceNo||"Quotation")+" — "+(v.clientName||""),v.type==="group"?"Group":"Private","quotations/"+k,v,{});FD("quotations/"+k).then(()=>{delete S.quotations[k];if(curPage==="allquot")rQLAllCore();toast("Deleted — Moved to Recycle Bin")}).catch(e=>toast("Delete failed: "+e.message,"err"))});};
+window.delQ=async k=>{const v=S.quotations[k];if(!v){toast("Quotation not found","err");return}if(!P("allquot","delete")){toast("You don't have All Quotations delete permission","err");return}confirmModal("Delete this quotation? (Stays in Recycle Bin for 7 days)",async()=>{await _trashAdd("quotation",(v.invoiceNo||"Quotation")+" — "+(v.clientName||""),v.type==="group"?"Group":"Private","quotations/"+k,v,{});FD("quotations/"+k).then(()=>{delete S.quotations[k];_selQuotOwn.delete(k);_selQuotAll.delete(k);if(curPage==="allquot")rQLAllCore();toast("Deleted — Moved to Recycle Bin")}).catch(e=>toast("Delete failed: "+e.message,"err"))});};
 function loadPvtForm(data){
 fillIf("pN",data.clientName);fillIf("pPh",data.contactNo);fillIf("pInc",data.pkgIncludes);fillIf("pDt",data.travelDates);
 ['A','B','C'].forEach(L=>{const o=data.options?.[L];if(!o)return;
@@ -3189,7 +4092,12 @@ function buildCostingCss(){
 *{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',Arial,sans-serif}
 @page{size:A4;margin:8mm}
 body{background:#fff;color:#0f172a;font-size:9px}
-.cost-pg{background:#fff;width:100%;max-width:210mm;margin:0 auto 6mm;padding:4mm 6mm}
+.cost-pg{position:relative;background:#fff;width:100%;max-width:210mm;margin:0 auto 6mm;padding:4mm 6mm;overflow:hidden}
+.cost-pg > *:not(.cost-wm){position:relative;z-index:2}
+.cost-wm{position:absolute;top:0;left:0;right:0;bottom:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:1;user-select:none;-webkit-user-select:none;overflow:hidden}
+.cost-wm-inner{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;transform:rotate(-24deg);opacity:0.05;width:140mm;max-width:85%;text-align:center;pointer-events:none}
+.cost-wm img{width:85mm;height:85mm;object-fit:contain;filter:grayscale(12%);display:block}
+.cost-wm-text{font-family:'Outfit','Segoe UI',Arial,sans-serif;font-size:22px;font-weight:900;letter-spacing:4px;color:#1e3a8a;text-transform:uppercase;white-space:nowrap;line-height:1}
 .cost-hdr{background:#1e3a8a;color:#fff;padding:6px 10px;border-radius:4px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px}
 .cost-hdr h1{font-size:13px;font-weight:800;letter-spacing:1px}
 .cost-hdr .sub{font-size:8px;opacity:.85}
@@ -3345,8 +4253,9 @@ window.printCostingPvt=function(){
     optHtml+=`${isFirst?"":""}<div class="opt-banner">OPTION ${L} — PRIVATE COSTING</div>${pvtCostingOptHtml(L,o,{})}`;
   });
   if(!optHtml){toast("No data found","warn");return}
-  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Costing — ${clientName}</title><style>${buildCostingCss()}</style></head><body><div class="cost-pg"><div class="cost-hdr"><div><h1>PRIVATE COSTING SHEET</h1><div class="sub">⚠ CONFIDENTIAL — Internal Use Only — Team Review</div></div><div class="sub" style="text-align:right">${s.company||""}<br>${s.phone||""}</div></div>${metaHtml}${optHtml}<div class="confidential">CONFIDENTIAL — Do not share with clients. For internal team review only. | ${s.company||""} | ${now}</div></div></body></html>`;
-  _openCostingPrint(html,"Costing_Private_"+clientName.replace(/[^a-zA-Z0-9]/g,"_"));
+  const costWmHtml=`<div class="cost-wm" aria-hidden="true"><div class="cost-wm-inner"><img src="${s.logo||'favicon.png'}" alt="" onerror="this.style.display='none'"><div class="cost-wm-text">${_esc((s.company||"Pak Globe Travels").toUpperCase())}</div></div></div>`;
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Costing — ${clientName}</title><style>${buildCostingCss()}</style></head><body><div class="cost-pg">${costWmHtml}<div class="cost-hdr"><div><h1>PRIVATE COSTING SHEET</h1><div class="sub">⚠ CONFIDENTIAL — Internal Use Only — Team Review</div></div><div class="sub" style="text-align:right">${s.company||""}<br>${s.phone||""}</div></div>${metaHtml}${optHtml}<div class="confidential">CONFIDENTIAL — Do not share with clients. For internal team review only. | ${s.company||""} | ${now}</div></div></body></html>`;
+  _openCostingPrint(html,formatPdfFilename(clientName,"Costing_Private",invNo));
 };
 
 window.printCostingGrp=function(){
@@ -3397,8 +4306,9 @@ window.printCostingGrp=function(){
     body+=`<tr><td class="lbl">${nm} (${c})</td><td>${c}</td><td>${fmt(tk)}</td><td>${hPer}</td><td>${vPer}</td><td>${tPer}</td><td><b>${fmt(parseFloat(net)||0)}</b></td><td>${fmt(n($(`g${c===5?"PQ":c===4?"PQd":c===3?"PT":"PD"}`)?.value))}</td><td style="color:#059669;font-weight:800">PKR ${fmt(parseFloat(sell)||0)}</td></tr>`;
   });
   body+=`</tbody></table>`;
-  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Costing — ${clientName}</title><style>${buildCostingCss()}</style></head><body><div class="cost-pg"><div class="cost-hdr"><div><h1>GROUP COSTING SHEET</h1><div class="sub">⚠ CONFIDENTIAL — Internal Use Only — Team Review</div></div><div class="sub" style="text-align:right">${s.company||""}<br>${s.phone||""}</div></div>${metaHtml}${body}<div class="confidential">CONFIDENTIAL — Do not share with clients. For internal team review only. | ${s.company||""} | ${now}</div></div></body></html>`;
-  _openCostingPrint(html,"Costing_Group_"+clientName.replace(/[^a-zA-Z0-9]/g,"_"));
+  const costWmHtmlGrp=`<div class="cost-wm" aria-hidden="true"><div class="cost-wm-inner"><img src="${s.logo||'favicon.png'}" alt="" onerror="this.style.display='none'"><div class="cost-wm-text">${_esc((s.company||"Pak Globe Travels").toUpperCase())}</div></div></div>`;
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Costing — ${clientName}</title><style>${buildCostingCss()}</style></head><body><div class="cost-pg">${costWmHtmlGrp}<div class="cost-hdr"><div><h1>GROUP COSTING SHEET</h1><div class="sub">⚠ CONFIDENTIAL — Internal Use Only — Team Review</div></div><div class="sub" style="text-align:right">${s.company||""}<br>${s.phone||""}</div></div>${metaHtml}${body}<div class="confidential">CONFIDENTIAL — Do not share with clients. For internal team review only. | ${s.company||""} | ${now}</div></div></body></html>`;
+  _openCostingPrint(html,formatPdfFilename(clientName,"Costing_Group",invNo));
 };
 function _openCostingPrint(html,filename){
   // Show as full overlay print preview with Download PDF + Print options
@@ -3449,7 +4359,7 @@ window._costingDownloadPdf=async function(){
       if(imgH<=297){pdf.addImage(imgData,"JPEG",0,0,210,imgH,undefined,"FAST")}
       else{const sw=210*(297/imgH);pdf.addImage(imgData,"JPEG",(210-sw)/2,0,sw,297,undefined,"FAST")}
     }
-    pdf.save((window._costingFilename||"Costing")+".pdf");
+    pdf.save((window._costingFilename||formatPdfFilename("Costing","Costing")).replace(/\.pdf$/i,"")+".pdf");
     toast("PDF downloaded successfully!");
     document.body.removeChild(holder);
   }catch(e){toast("PDF error: "+e.message,"err")}
@@ -3503,7 +4413,7 @@ function printPvtDirect(d,s,selectedLabels){
   const vo=selectedLabels?opts.filter(([l])=>selectedLabels.includes(l)):_filterPrintOpts(opts);
   if(!vo.length){toast("No data to print","warn");return}
   const logo=s.logo?`<div class="logo-wrap"><img src="${s.logo}"></div>`:`<div class="logo-fb">${(s.company||"P")[0]}</div>`;
-  const fn=(d.clientName||"Quotation").replace(/[^a-zA-Z0-9 ]/g,"").trim()+(d.invoiceNo?"-"+d.invoiceNo:"");
+  const fn=formatPdfFilename(d.clientName,"Customized_Umrah",d.invoiceNo);
 
   /* ---- Client info block: built PER OPTION using that option's pax data ---- */
   const makeCinfoHtml=(o)=>{
@@ -3523,7 +4433,7 @@ function printPvtDirect(d,s,selectedLabels){
 
   /* ---- Instruction page HTML ---- */
   const instrPageHtml=s.instructions
-    ?`<div class="pp instr-page"><div class="instr">${renderInstructionsHTML(s.instructions)}</div></div>`
+    ?`<div class="pp instr-page" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}<div class="instr">${renderInstructionsHTML(s.instructions)}</div></div>`
     :"";
 
   if(vo.length===1){
@@ -3543,7 +4453,7 @@ function printPvtDirect(d,s,selectedLabels){
     if(o.childPax>0)body+=`<div class="sum-row"><span>Child Per Pax:</span><b style="color:#c2410c!important">PKR ${fmt(o.perChild)}</b></div>`;
     if(o.infantPax>0)body+=`<div class="sum-row inf"><span>Infant Per Pax:</span><b>PKR ${fmt(o.perInfant)}</b></div>`;
     body+=`</div></div>`;
-    const html=`<div class="pp pp-single" style="--brand:${s.brandColor||"#1F4AA8"}">${ppHeader(s,logo)}<div class="title">CUSTOMIZED UMRAH PACKAGE</div>${ppIcards(d,"Customized Umrah")}${makeCinfoHtml(o)}<div class="pp-body">${body}</div>${ppFooter(s)}</div>${instrPageHtml}`;
+    const html=`<div class="pp pp-single" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}${ppHeader(s,logo)}<div class="title">CUSTOMIZED UMRAH PACKAGE</div>${ppIcards(d,"Customized Umrah")}${makeCinfoHtml(o)}<div class="pp-body">${body}</div>${ppFooter(s)}</div>${instrPageHtml}`;
     openPrintPreview(html,fn,{kind:"pvt",d,s});
   }else{
     /* Multiple options:
@@ -3568,7 +4478,7 @@ function printPvtDirect(d,s,selectedLabels){
       body+=`</div></div>`;
       /* Full header + FULL client details on EVERY option page */
       const topBlock=`${ppHeader(s,logo)}<div class="title">CUSTOMIZED UMRAH PACKAGE — OPTION ${l}</div>${ppIcards(d,"Customized Umrah")}${makeCinfoHtml(o)}`;
-      pagesHtml+=`<div class="pp" style="--brand:${s.brandColor||"#1F4AA8"}">${topBlock}<div class="pp-body">${body}</div>${ppFooter(s)}</div>`;
+      pagesHtml+=`<div class="pp" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}${topBlock}<div class="pp-body">${body}</div>${ppFooter(s)}</div>`;
     });
     /* Instructions: sirf ek baar sab options ke baad */
     pagesHtml+=instrPageHtml;
@@ -3602,30 +4512,713 @@ const s=effectiveSettings(d);
 let days=n(d.days);if(!days){d.hotels?.forEach(h=>days+=n(h.ngt));days++}
 const logo=s.logo?`<div class="logo-wrap"><img src="${s.logo}"></div>`:`<div class="logo-fb">${(s.company||"P")[0]}</div>`;
 const vh=d.hotels?.filter(h=>h.name).map(liveHotel)||[];const vt=d.transports?.filter(t=>t.sec&&t.qty>0)||[];
-const instrHtml=s.instructions?`<div class="pp instr-page"><div class="instr">${renderInstructionsHTML(s.instructions)}</div></div>`:"";
+const instrHtml=s.instructions?`<div class="pp instr-page" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}<div class="instr">${renderInstructionsHTML(s.instructions)}</div></div>`:"";
 const priceHead=rooms.map(k=>`<th>${ROOM_LABELS[k]}</th>`).join("");
 const priceRow=rooms.map(k=>`<td>PKR ${d.results?.[k]?.sell||"-"}</td>`).join("");
-const html=`<div class="pp" style="--brand:${s.brandColor||"#1F4AA8"}">${ppHeader(s,logo)}<div class="title">UMRAH PACKAGE — GROUP</div>${ppIcards(d,"Group Umrah")}${d.heading?`<div style="text-align:center;padding:6px;font-weight:800;font-size:10px;color:var(--brand,#1F4AA8);margin-bottom:8px;background:#F5F7FA;border:1px solid #dbe2ea;border-radius:5px">${d.heading}</div>`:""}<div class="cinfo"><div class="cinfo-col"><div class="ci-item"><b>Client:</b><span>${d.clientName||""}</span></div><div class="ci-item"><b>Airline:</b><span>${d.airline||""}</span></div><div class="ci-item"><b>Days:</b><span>${days}</span></div></div><div class="cinfo-col"><div class="ci-item"><b>📅 Travel Dates:</b><span>${fmtDisplayDate(d.travelDates||"")}</span></div><div class="ci-item"><b>🎟 Ticket:</b><span>PKR ${fmt(d.ticketPP)}</span></div><div class="ci-item"><b>✅ Includes:</b><span>${d.pkgIncludes||""}</span></div></div></div><div class="pp-body"><div class="sec-hdr"><span class="ic">✈️</span> TRAVEL DETAILS <span class="ic">✈️</span></div>${vh.length?`<div class="sec"><span class="ic">🏨</span> Hotels</div>${ppHotelBoxes(vh,h=>cityLabel(h.city))}`:""}${ppTransportTable(vt)}${ppVisaTable(d,s?.defaultROE||78)}<div class="sec">Pricing Per Pax</div><table class="price-tbl"><thead><tr><th>Room</th>${priceHead}</tr></thead><tbody><tr class="sell"><td>Selling</td>${priceRow}</tr></tbody></table></div>${ppFooter(s)}</div>${instrHtml}`;
-const fnG=(d.clientName||"Quotation").replace(/[^a-zA-Z0-9 ]/g,"").trim()+(d.invoiceNo?"-"+d.invoiceNo:"");
+const html=`<div class="pp" style="--brand:${s.brandColor||"#1F4AA8"}">${ppWatermark(s)}${ppHeader(s,logo)}<div class="title">UMRAH PACKAGE — GROUP</div>${ppIcards(d,"Group Umrah")}${d.heading?`<div style="text-align:center;padding:6px;font-weight:800;font-size:10px;color:var(--brand,#1F4AA8);margin-bottom:8px;background:#F5F7FA;border:1px solid #dbe2ea;border-radius:5px">${d.heading}</div>`:""}<div class="cinfo"><div class="cinfo-col"><div class="ci-item"><b>Client:</b><span>${d.clientName||""}</span></div><div class="ci-item"><b>Airline:</b><span>${d.airline||""}</span></div><div class="ci-item"><b>Days:</b><span>${days}</span></div></div><div class="cinfo-col"><div class="ci-item"><b>📅 Travel Dates:</b><span>${fmtDisplayDate(d.travelDates||"")}</span></div><div class="ci-item"><b>🎟 Ticket:</b><span>PKR ${fmt(d.ticketPP)}</span></div><div class="ci-item"><b>✅ Includes:</b><span>${d.pkgIncludes||""}</span></div></div></div><div class="pp-body"><div class="sec-hdr"><span class="ic">✈️</span> TRAVEL DETAILS <span class="ic">✈️</span></div>${vh.length?`<div class="sec"><span class="ic">🏨</span> Hotels</div>${ppHotelBoxes(vh,h=>cityLabel(h.city))}`:""}${ppTransportTable(vt)}${ppVisaTable(d,s?.defaultROE||78)}<div class="sec">Pricing Per Pax</div><table class="price-tbl"><thead><tr><th>Room</th>${priceHead}</tr></thead><tbody><tr class="sell"><td>Selling</td>${priceRow}</tr></tbody></table></div>${ppFooter(s)}</div>${instrHtml}`;
+const fnG=formatPdfFilename(d.clientName,"Group_Umrah",d.invoiceNo);
 openPrintPreview(html,fnG,{kind:"grp",d,s})
 }
 
 
-async function pgHtl(pg){const canAdd=P("htl","add"),canEdit=P("htl","edit"),canDel=P("htl","delete"),ro=!canAdd&&!canEdit&&!canDel;
-pg.innerHTML=`<div class="cd" style="text-align:center;padding:28px;color:var(--t2)">⏳ Loading hotels…</div>`;
-try{
-  await Promise.all(S.cities.map(c=>ensureHotelsLoaded(c.key)));
-}catch(e){
-  if(pg.isConnected)pg.innerHTML=`<div class="cd" style="text-align:center;padding:28px;color:var(--er)">⚠ Hotels could not be loaded — please check your internet.<br><small style="color:var(--t2)">${e.message}</small><br><button class="btn btn-sm btn-p" style="margin-top:10px" onclick="pgHtl($('CT').firstChild)">🔄 Retry</button></div>`;
-  return;
+/* ===== HOTEL MANAGEMENT SCREEN (HIGH PERFORMANCE & MODERN UI) ===== */
+let _htlSearchQuery="";
+let _htlActiveCity="all";
+let _htlViewMode="grid"; // 'grid' or 'table'
+let _htlSortBy="distance"; // 'distance', 'dist_desc', 'name_asc', 'name_desc', 'recent', 'stars_desc', 'has_photo'
+let _htlPage=1;
+let _htlPageSize=12; // 12, 24, 48, 99999
+let _htlSearchDebounceTimer=null;
+
+function parseHotelDistance(d){
+  if(!d && d !== 0) return { meters: 99999, label: "Distance unspecified", walkTime: "Contact hotel for location", isShuttle: false };
+  const s = String(d).trim().toLowerCase();
+  
+  // Explicit courtyard / 0 indicators
+  if(s === "0" || s === "0m" || s === "0 m" || s === "0 meter" || s === "0 mtr" || s.includes("courtyard") || s.includes("clock tower") || s.includes("opposite haram") || s.includes("inside haram") || s.includes("zero")){
+    return { meters: 0, label: "0m · Haram Courtyard", walkTime: "Direct Courtyard / 1 min walk", isShuttle: false };
+  }
+  
+  // Check kilometers (e.g. 1.2km, 1.5 km, 2 km)
+  const kmMatch = s.match(/([\d.]+)\s*k(?:m|ilo)/);
+  if(kmMatch){
+    const meters = Math.round(parseFloat(kmMatch[1]) * 1000);
+    return { meters, label: `${meters}m`, walkTime: meters >= 800 ? "Free Shuttle Bus (~5-8 min)" : `~${Math.round(meters/80)} min walk`, isShuttle: meters >= 800 };
+  }
+
+  // Check meters number (e.g. 150m, 350 Mtr, 500, 1200)
+  const numMatch = s.match(/(\d+)/);
+  if(numMatch){
+    const meters = parseInt(numMatch[1], 10);
+    let walkTime = "";
+    let isShuttle = meters >= 800 || s.includes("shuttle") || s.includes("bus");
+    if(meters === 0) walkTime = "Direct Courtyard / 1 min walk";
+    else if(meters <= 50) walkTime = "Direct Haram Access (~1 min walk)";
+    else if(meters <= 150) walkTime = "~2 min easy walk";
+    else if(meters <= 350) walkTime = "~4-5 min walk";
+    else if(meters <= 600) walkTime = "~7-8 min walk";
+    else if(isShuttle) walkTime = "24/7 Free Haram Shuttle";
+    else walkTime = `~${Math.round(meters/75)} min walk`;
+    return { meters, label: `${meters}m`, walkTime, isShuttle };
+  }
+
+  return { meters: 99999, label: d, walkTime: "Contact hotel for details", isShuttle: s.includes("shuttle") || s.includes("bus") };
 }
-if(!pg.isConnected)return; // is dauran user kisi aur page par chala gaya
-// Branch-wise hotel info
-const branchNote=S.activeBranch?`<div style="background:#d1fae5;border:1px solid #6ee7b7;border-radius:6px;padding:8px 12px;font-size:.75rem;color:#065f46;margin-bottom:8px">🏢 Hotels shown for your branch: <b>${S.activeBranch.name}</b>. SuperAdmin can see hotels for all branches.</div>`:"";
-let html=branchNote+`<div class="cd" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><div style="font-weight:700">${canAdd?"Hotels Management":"Hotels (View Only)"}</div><div style="display:flex;gap:6px;flex-wrap:wrap">${canAdd?`<button class="btn btn-sm btn-o" onclick="addCity()">+ Add City</button><button class="btn btn-sm btn-g" onclick="openImportHotels()">⬆ Import Hotels</button>`:""}<button class="btn btn-sm btn-a" onclick="findDupes()">🔍 Find Duplicates</button></div></div>`;
-S.cities.forEach(c=>{const isCore=c.key==="makkah"||c.key==="madina";html+=`<div class="cd"><div class="coll-h" onclick="this.classList.toggle('closed');this.nextElementSibling.classList.toggle('closed')">${c.label} (${(S.hotels[c.key]||[]).length}) <span class="arr">▼</span></div><div class="coll-b">${canAdd?`<div style="margin-bottom:6px;display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-sm btn-p" onclick="addH('${c.key}')">+ Add Hotel</button>${isCore?"":`<button class="btn btn-sm btn-d" onclick="delCity('${c.key}')">🗑 Remove City</button>`}</div>`:""}<div class="tw tw-fit" style="max-height:400px;overflow-y:auto;overflow-x:auto"><table style="table-layout:auto;width:100%"><thead><tr><th style="width:1%;white-space:nowrap">#</th><th>Name</th><th style="width:62px">Dist.</th><th style="width:${ro?30:82}px"></th></tr></thead><tbody id="hL_${c.key}"></tbody></table></div></div></div>`});
-pg.innerHTML=html;rH()}
-function rH(){const canEdit=P("htl","edit"),canDel=P("htl","delete");const ic="style=\"padding:3px 5px;font-size:.78rem;line-height:1;display:inline-flex;align-items:center;justify-content:center\"";S.cities.forEach(c=>{const el=$("hL_"+c.key);if(!el)return;const list=S.hotels[c.key]||[];el.innerHTML=list.length?list.map((h,i)=>`<tr><td class="label-cell" style="white-space:nowrap">#${i+1}</td><td data-label="Name" style="word-break:break-word;white-space:normal">${_esc(h.n)}</td><td data-label="Dist" style="color:var(--t2);word-break:break-word;white-space:normal">${_esc(h.d)}</td><td data-label="Actions"><div style="display:flex;align-items:center;gap:2px">${h.loc?`<a href="${_esc(h.loc)}" target="_blank" rel="noopener" class="btn-icon" ${ic} title="Open in Google Maps">📍</a>`:""}${canEdit?`<button class="btn-icon" ${ic} onclick="eH('${c.key}',${i})">✏</button>`:""}${canDel?`<button class="btn-icon" ${ic} style="color:var(--er)" onclick="dH('${c.key}',${i})">🗑</button>`:""}</div></td></tr>`).join(""):`<tr><td colspan="4" style="text-align:center;color:var(--t2)">Empty</td></tr>`})}
+
+function inferHotelStars(h){
+  if(h.stars && typeof h.stars === 'number' && h.stars >= 1 && h.stars <= 5) return h.stars;
+  const name = (h.n||"").toUpperCase();
+  if(name.includes("FAIRMONT") || name.includes("CLOCK ROYAL") || name.includes("RAFFLES") || name.includes("PULLMAN") || name.includes("SWISSOTEL") || name.includes("MOVENPICK") || name.includes("OBERAI") || name.includes("INTERCONTINENTAL") || name.includes("HILTON") || name.includes("DAR AL TAQWA") || name.includes("DAR AL IMAN") || name.includes("SHERATON") || name.includes("CONRAD") || name.includes("ANJUM") || name.includes("MARRIOTT") || name.includes("SOFITEL")) return 5;
+  if(name.includes("GRAND") || name.includes("ROTANA") || name.includes("AL SAFWA") || name.includes("LE MERIDIEN") || name.includes("ROYAL") || name.includes("MAWADDAH") || name.includes("MILLENNIUM") || name.includes("RADISSON") || name.includes("FRONTEL") || name.includes("TAIBA") || name.includes("SHAZA") || name.includes("TOWERS") || name.includes("VOUCO") || name.includes("AL KISWAH")) return 4;
+  const dist = parseHotelDistance(h.d).meters;
+  if(dist <= 100) return 5;
+  if(dist <= 400) return 4;
+  return 3;
+}
+
+function inferHotelAmenities(h){
+  const stars = inferHotelStars(h);
+  const distObj = parseHotelDistance(h.d);
+  const items = [
+    { icon: "📶", label: "Free High-Speed WiFi" },
+    { icon: "❄️", label: "Central Air Conditioning" },
+    { icon: "🛗", label: "Fast Elevators" },
+    { icon: "🛎️", label: "24/7 Reception Desk" }
+  ];
+  if(distObj.isShuttle || distObj.meters >= 600){
+    items.push({ icon: "🚌", label: "24/7 Free Haram Shuttle Bus" });
+  } else {
+    items.push({ icon: "🚶", label: "Walking Distance to Haram" });
+  }
+  if(stars >= 4){
+    items.push({ icon: "🍽️", label: "Multi-Cuisine Buffet Dining" });
+    items.push({ icon: "🧹", label: "Daily Room Service & Housekeeping" });
+    items.push({ icon: "☕", label: "Tea/Coffee Maker & Mini Bar" });
+  }
+  if(stars === 5){
+    items.push({ icon: "🕋", label: "Haram & Kaaba View Rooms" });
+    items.push({ icon: "✨", label: "VIP Concierge & Luggage Service" });
+  }
+  items.push({ icon: "🕌", label: "In-Hotel Prayer Hall" });
+  return items;
+}
+
+window.quickViewHotel = (cityKey, origIdx) => {
+  const list = S.hotels[cityKey] || [];
+  const h = list[origIdx];
+  if(!h) return toast("Hotel not found", "err");
+
+  const cObj = S.cities.find(c => c.key === cityKey) || { key: cityKey, label: cityKey };
+  const stars = inferHotelStars(h);
+  const distObj = parseHotelDistance(h.d);
+  const amenities = inferHotelAmenities(h);
+  const starStars = "★".repeat(stars) + "☆".repeat(Math.max(0, 5 - stars));
+  const cityIcon = cityKey === "makkah" ? "🕋" : (cityKey === "madina" ? "🕌" : "🏙️");
+  const canEdit = P("htl", "edit");
+
+  const modalHtml = `
+    <div class="htl-qv-modal">
+      <div class="htl-qv-banner">
+        ${h.img ? `<img src="${_esc(h.img)}" alt="${_esc(h.n)}" class="htl-qv-img">` : `<div class="htl-qv-banner-placeholder"><span style="font-size:2.8rem">🏨</span><span style="font-size:.82rem;font-weight:800;opacity:.95">${cityIcon} ${_esc(cObj.label)}</span></div>`}
+        <div class="htl-qv-badges">
+          <span class="htl-qv-badge city">${cityIcon} ${_esc(cObj.label)}</span>
+          <span class="htl-qv-badge stars">${starStars} (${stars}-Star)</span>
+          ${distObj.meters < 99999 ? `<span class="htl-qv-badge dist">📍 ${_esc(h.d || distObj.label)}</span>` : ""}
+        </div>
+      </div>
+
+      <div class="htl-qv-body">
+        <div class="htl-qv-header">
+          <h2 class="htl-qv-title">${_esc(h.n)}</h2>
+          <div class="htl-qv-sub">
+            <span class="htl-qv-rating-stars">${starStars}</span>
+            <span style="color:var(--t2)">•</span>
+            <span style="font-weight:700;color:var(--p)">${stars}-Star Premium Hospitality</span>
+          </div>
+        </div>
+
+        <div class="htl-qv-grid">
+          <div class="htl-qv-card">
+            <div class="htl-qv-card-icon">📍</div>
+            <div class="htl-qv-card-content">
+              <div class="htl-qv-card-label">Distance & Proximity</div>
+              <div class="htl-qv-card-val">${_esc(h.d || "Distance Unspecified")}</div>
+              <div class="htl-qv-card-hint">🚶 ${distObj.walkTime}</div>
+            </div>
+          </div>
+
+          <div class="htl-qv-card">
+            <div class="htl-qv-card-icon">🗺️</div>
+            <div class="htl-qv-card-content">
+              <div class="htl-qv-card-label">Google Maps Location</div>
+              <div class="htl-qv-card-val">${h.loc ? `<a href="${_esc(h.loc)}" target="_blank" rel="noopener" class="htl-qv-map-link">📍 View on Google Maps ↗</a>` : `<span style="color:var(--t2)">No map link saved</span>`}</div>
+              <div class="htl-qv-card-hint">${h.loc ? "Live navigation & coordinates verified" : "Edit hotel to attach Google Maps link"}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="htl-qv-sec">
+          <div class="htl-qv-sec-title">✨ Key Amenities & Guest Features</div>
+          <div class="htl-qv-amenities-wrap">
+            ${amenities.map(a => `<div class="htl-qv-amenity-pill"><span class="ic">${a.icon}</span> <span>${a.label}</span></div>`).join("")}
+          </div>
+        </div>
+
+        <div class="htl-qv-sec">
+          <div class="htl-qv-sec-title">📋 Hotel Summary & Quotation Ready Data</div>
+          <div class="htl-qv-summary-box">
+            <div><b>Hotel:</b> ${_esc(h.n)}</div>
+            <div><b>Location:</b> ${_esc(cObj.label)} (${_esc(h.d || "Standard")})</div>
+            <div><b>Proximity Estimate:</b> ${distObj.walkTime}</div>
+            <div><b>Hospitality Rating:</b> ${stars}-Star Standard</div>
+            ${h.loc ? `<div><b>Google Maps:</b> <a href="${_esc(h.loc)}" target="_blank" rel="noopener" style="color:var(--p);text-decoration:underline">${_esc(h.loc)}</a></div>` : ""}
+          </div>
+        </div>
+      </div>
+
+      <div class="htl-qv-footer">
+        <button type="button" class="btn btn-o" onclick="copyHotelFullDetails('${_esc(cityKey)}', ${origIdx})">
+          <span>📋 Copy for WhatsApp</span>
+        </button>
+        ${h.loc ? `
+          <a href="${_esc(h.loc)}" target="_blank" rel="noopener" class="btn btn-a" style="text-decoration:none">
+            <span>🗺️ Open Map</span>
+          </a>
+        ` : ""}
+        ${canEdit ? `
+          <button type="button" class="btn btn-p" onclick="closeModal(); eH('${cityKey}', ${origIdx})">
+            <span>✏️ Edit Hotel</span>
+          </button>
+        ` : ""}
+        <button type="button" class="btn btn-o" onclick="closeModal()">
+          <span>Close</span>
+        </button>
+      </div>
+    </div>
+  `;
+
+  showCustomModal("Hotel Quick View", modalHtml);
+};
+
+window.copyHotelFullDetails = (cityKey, origIdx) => {
+  const list = S.hotels[cityKey] || [];
+  const h = list[origIdx];
+  if(!h) return;
+  const cObj = S.cities.find(c => c.key === cityKey) || { label: cityKey };
+  const stars = inferHotelStars(h);
+  const distObj = parseHotelDistance(h.d);
+  const starStars = "⭐".repeat(stars);
+
+  const text = `🏨 *${h.n}*
+📍 *City:* ${cObj.label}
+⭐ *Rating:* ${starStars} (${stars}-Star)
+📏 *Distance:* ${h.d || "Standard"} (${distObj.walkTime})
+${h.loc ? `🗺️ *Google Maps:* ${h.loc}\n` : ""}✨ *Amenities:* Free WiFi, Central AC, Elevators, 24/7 Reception${distObj.isShuttle ? ", 24/7 Free Haram Shuttle Bus" : ""}`;
+
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(()=>toast("Hotel details copied for WhatsApp! ✅")).catch(()=>toast(`Copied: ${h.n}`));
+  } else {
+    toast(`Copied: ${h.n}`);
+  }
+};
+
+function sortHotelMatches(matches, sortBy){
+  const copy = matches.slice();
+  if(sortBy === "distance"){
+    copy.sort((a, b) => {
+      const da = parseHotelDistance(a.hotel.d).meters;
+      const db = parseHotelDistance(b.hotel.d).meters;
+      if(da !== db) return da - db;
+      return (a.hotel.n||"").localeCompare(b.hotel.n||"");
+    });
+  } else if(sortBy === "dist_desc"){
+    copy.sort((a, b) => {
+      const da = parseHotelDistance(a.hotel.d).meters;
+      const db = parseHotelDistance(b.hotel.d).meters;
+      if(da !== db) return db - da;
+      return (a.hotel.n||"").localeCompare(b.hotel.n||"");
+    });
+  } else if(sortBy === "name_asc"){
+    copy.sort((a, b) => (a.hotel.n||"").localeCompare(b.hotel.n||""));
+  } else if(sortBy === "name_desc"){
+    copy.sort((a, b) => (b.hotel.n||"").localeCompare(a.hotel.n||""));
+  } else if(sortBy === "recent"){
+    copy.sort((a, b) => b.origIdx - a.origIdx);
+  } else if(sortBy === "stars_desc"){
+    copy.sort((a, b) => {
+      const sa = inferHotelStars(a.hotel);
+      const sb = inferHotelStars(b.hotel);
+      if(sa !== sb) return sb - sa;
+      return (a.hotel.n||"").localeCompare(b.hotel.n||"");
+    });
+  } else if(sortBy === "has_photo"){
+    copy.sort((a, b) => {
+      const ha = Boolean(a.hotel.img);
+      const hb = Boolean(b.hotel.img);
+      if(ha !== hb) return hb ? 1 : -1;
+      return (a.hotel.n||"").localeCompare(b.hotel.n||"");
+    });
+  }
+  return copy;
+}
+
+function renderHtlPagination(totalItems, currentPage, pageSize){
+  if(totalItems <= 0) return "";
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  if(totalPages <= 1 && totalItems <= 12) return "";
+
+  const startItem = (currentPage - 1) * pageSize + 1;
+  const endItem = Math.min(totalItems, currentPage * pageSize);
+
+  let pageBtnsHtml = "";
+  pageBtnsHtml += `<button type="button" class="htl-page-btn prev" ${currentPage <= 1 ? "disabled" : ""} onclick="_setHtlPage(${currentPage - 1})">‹ Prev</button>`;
+
+  const maxButtons = 5;
+  let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2));
+  let endPage = Math.min(totalPages, startPage + maxButtons - 1);
+  if(endPage - startPage + 1 < maxButtons){
+    startPage = Math.max(1, endPage - maxButtons + 1);
+  }
+
+  if(startPage > 1){
+    pageBtnsHtml += `<button type="button" class="htl-page-btn" onclick="_setHtlPage(1)">1</button>`;
+    if(startPage > 2) pageBtnsHtml += `<span class="htl-page-dots">…</span>`;
+  }
+
+  for(let p = startPage; p <= endPage; p++){
+    pageBtnsHtml += `<button type="button" class="htl-page-btn ${p === currentPage ? "active" : ""}" onclick="_setHtlPage(${p})">${p}</button>`;
+  }
+
+  if(endPage < totalPages){
+    if(endPage < totalPages - 1) pageBtnsHtml += `<span class="htl-page-dots">…</span>`;
+    pageBtnsHtml += `<button type="button" class="htl-page-btn" onclick="_setHtlPage(${totalPages})">${totalPages}</button>`;
+  }
+
+  pageBtnsHtml += `<button type="button" class="htl-page-btn next" ${currentPage >= totalPages ? "disabled" : ""} onclick="_setHtlPage(${currentPage + 1})">Next ›</button>`;
+
+  return `
+    <div class="htl-pagination-bar">
+      <div class="htl-page-info">
+        Showing <b>${startItem}-${endItem}</b> of <b>${totalItems}</b> hotels
+      </div>
+      <div class="htl-page-controls">
+        ${pageBtnsHtml}
+      </div>
+      <div class="htl-page-size-wrap">
+        <label for="htlPageSizeSelect">Per page:</label>
+        <select id="htlPageSizeSelect" class="htl-page-size-select" onchange="_setHtlPageSize(this.value)">
+          <option value="12" ${pageSize === 12 ? "selected" : ""}>12</option>
+          <option value="24" ${pageSize === 24 ? "selected" : ""}>24</option>
+          <option value="48" ${pageSize === 48 ? "selected" : ""}>48</option>
+          <option value="all" ${pageSize >= 99999 ? "selected" : ""}>All</option>
+        </select>
+      </div>
+    </div>
+  `;
+}
+
+async function pgHtl(pg){
+  const canAdd=P("htl","add"),canEdit=P("htl","edit"),canDel=P("htl","delete"),ro=!canAdd&&!canEdit&&!canDel;
+  
+  // Render structure instantly from memory/cache
+  _renderHtlShell(pg);
+
+  // Background check / pre-load for any missing cities
+  try{
+    await Promise.all(S.cities.map(c=>ensureHotelsLoaded(c.key)));
+    if(pg.isConnected){
+      _renderHtlStats();
+      _renderHtlTabs();
+      rH();
+    }
+  }catch(e){
+    console.warn("[Hotels] Background load notice:",e.message);
+  }
+}
+
+function _renderHtlShell(pg){
+  const canAdd=P("htl","add");
+  const branchNote=S.activeBranch?`<div style="background:var(--p-soft);border:1px solid var(--p-bd);border-radius:8px;padding:10px 14px;font-size:.78rem;color:var(--p);margin-bottom:14px;display:flex;align-items:center;gap:8px"><span style="font-size:1.1rem">🏢</span><div>Hotels for branch: <b>${_esc(S.activeBranch.name||"")}</b>. SuperAdmin can view all inventory.</div></div>`:"";
+
+  pg.innerHTML=`
+    ${branchNote}
+    <div id="htlStatsBar" class="htl-stats-bar"></div>
+
+    <div class="htl-toolbar">
+      <div class="htl-search-wrap">
+        <span class="htl-search-ic">🔍</span>
+        <input id="htlSearchInput" type="text" placeholder="Search hotels by name, distance, or city..." value="${_esc(_htlSearchQuery)}" oninput="_onHtlSearch(this.value)">
+        ${_htlSearchQuery?`<button class="btn-clear-search" onclick="_clearHtlSearch()">✕</button>`:""}
+      </div>
+
+      <div class="htl-sort-wrap">
+        <span class="htl-sort-ic">↕️</span>
+        <select id="htlSortSelect" class="htl-sort-select" onchange="_setHtlSort(this.value)" title="Sort hotels">
+          <option value="distance" ${_htlSortBy==='distance'?'selected':''}>📍 Distance (Closest)</option>
+          <option value="dist_desc" ${_htlSortBy==='dist_desc'?'selected':''}>📍 Distance (Furthest)</option>
+          <option value="name_asc" ${_htlSortBy==='name_asc'?'selected':''}>🔤 Name (A → Z)</option>
+          <option value="name_desc" ${_htlSortBy==='name_desc'?'selected':''}>🔤 Name (Z → A)</option>
+          <option value="recent" ${_htlSortBy==='recent'?'selected':''}>🕒 Recently Added</option>
+          <option value="stars_desc" ${_htlSortBy==='stars_desc'?'selected':''}>⭐ Stars (Highest)</option>
+          <option value="has_photo" ${_htlSortBy==='has_photo'?'selected':''}>🖼️ With Photos First</option>
+        </select>
+      </div>
+
+      <div class="htl-actions">
+        <div class="htl-view-toggle">
+          <button class="view-btn ${_htlViewMode==='grid'?'active':''}" onclick="_setHtlViewMode('grid')" title="Compact Grid View">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            <span>Grid</span>
+          </button>
+          <button class="view-btn ${_htlViewMode==='table'?'active':''}" onclick="_setHtlViewMode('table')" title="Detailed Table View">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+            <span>Table</span>
+          </button>
+        </div>
+
+        ${canAdd?`
+          <button class="btn btn-sm btn-p" onclick="_openAddHotelModal()">
+            <span>+ Add Hotel</span>
+          </button>
+          <button class="btn btn-sm btn-o" onclick="addCity()">
+            <span>+ Add City</span>
+          </button>
+          <button class="btn btn-sm btn-g" onclick="openImportHotels()">
+            <span>⬆ Import</span>
+          </button>
+        `:""}
+        <button class="btn btn-sm btn-a" onclick="findDupes()">
+          <span>🔍 Duplicates</span>
+        </button>
+      </div>
+    </div>
+
+    <div id="htlCityTabs" class="htl-city-tabs"></div>
+
+    <div id="htlContentArea" class="htl-content-area"></div>
+  `;
+
+  _renderHtlStats();
+  _renderHtlTabs();
+  rH();
+}
+
+function _renderHtlStats(){
+  const bar=$("htlStatsBar");if(!bar)return;
+  let totalHotels=0;
+  let withLocation=0;
+  let withPhoto=0;
+  const citiesCount=S.cities.length;
+
+  S.cities.forEach(c=>{
+    const list=S.hotels[c.key]||[];
+    totalHotels+=list.length;
+    list.forEach(h=>{
+      if(h.loc)withLocation++;
+      if(h.img)withPhoto++;
+    });
+  });
+
+  bar.innerHTML=`
+    <div class="htl-stat-card">
+      <div class="htl-stat-val">${totalHotels}</div>
+      <div class="htl-stat-lbl">Total Hotels</div>
+    </div>
+    <div class="htl-stat-card">
+      <div class="htl-stat-val">${citiesCount}</div>
+      <div class="htl-stat-lbl">Active Cities</div>
+    </div>
+    <div class="htl-stat-card">
+      <div class="htl-stat-val">${withLocation}</div>
+      <div class="htl-stat-lbl">Maps Linked</div>
+    </div>
+    <div class="htl-stat-card">
+      <div class="htl-stat-val">${withPhoto}</div>
+      <div class="htl-stat-lbl">With Photos</div>
+    </div>
+  `;
+}
+
+function _renderHtlTabs(){
+  const tabs=$("htlCityTabs");if(!tabs)return;
+  let totalHotels=0;
+  S.cities.forEach(c=>{totalHotels+=(S.hotels[c.key]||[]).length});
+
+  let html=`<button class="city-tab ${_htlActiveCity==='all'?'active':''}" onclick="_setHtlCity('all')">
+    All Cities <span class="tab-count">${totalHotels}</span>
+  </button>`;
+
+  S.cities.forEach(c=>{
+    const cnt=(S.hotels[c.key]||[]).length;
+    const isCore=c.key==="makkah"||c.key==="madina";
+    const icon=c.key==="makkah"?"🕋":c.key==="madina"?"🕌":"🏙️";
+    html+=`
+      <div class="city-tab-wrap">
+        <button class="city-tab ${_htlActiveCity===c.key?'active':''}" onclick="_setHtlCity('${c.key}')">
+          <span>${icon} ${c.label}</span>
+          <span class="tab-count">${cnt}</span>
+        </button>
+        ${(!isCore&&P("htl","delete"))?`
+          <button class="city-tab-del" title="Delete City" onclick="delCity('${c.key}')">✕</button>
+        `:""}
+      </div>
+    `;
+  });
+
+  tabs.innerHTML=html;
+}
+
+window._setHtlCity=(cityKey)=>{
+  _htlActiveCity=cityKey;
+  _htlPage=1;
+  _renderHtlTabs();
+  rH();
+};
+
+window._setHtlViewMode=(mode)=>{
+  _htlViewMode=mode;
+  const btnGrid=document.querySelector(".htl-view-toggle .view-btn:first-child");
+  const btnTable=document.querySelector(".htl-view-toggle .view-btn:last-child");
+  if(btnGrid)btnGrid.classList.toggle("active",mode==="grid");
+  if(btnTable)btnTable.classList.toggle("active",mode==="table");
+  rH();
+};
+
+window._setHtlSort=(sortBy)=>{
+  _htlSortBy=sortBy;
+  _htlPage=1;
+  rH();
+};
+
+window._setHtlPage=(p)=>{
+  _htlPage=Math.max(1, p);
+  rH();
+  const area=$("htlContentArea");
+  if(area)area.scrollIntoView({behavior:"smooth",block:"start"});
+};
+
+window._setHtlPageSize=(sz)=>{
+  _htlPageSize=sz==="all"?99999:parseInt(sz,10);
+  _htlPage=1;
+  rH();
+};
+
+window._onHtlSearch=(val)=>{
+  if(_htlSearchDebounceTimer)clearTimeout(_htlSearchDebounceTimer);
+  _htlSearchDebounceTimer=setTimeout(()=>{
+    _htlSearchQuery=val.trim();
+    _htlPage=1;
+    const clr=document.querySelector(".btn-clear-search");
+    if(clr)clr.style.display=_htlSearchQuery?"block":"none";
+    rH();
+  },120);
+};
+
+window._clearHtlSearch=()=>{
+  _htlSearchQuery="";
+  _htlPage=1;
+  const inp=$("htlSearchInput");if(inp)inp.value="";
+  const clr=document.querySelector(".btn-clear-search");
+  if(clr)clr.style.display="none";
+  rH();
+};
+
+window._copyHotelName=(name)=>{
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(name).then(()=>toast(`Copied "${name}"`)).catch(()=>toast(`Selected: ${name}`));
+  }else{
+    toast(`Hotel: ${name}`);
+  }
+};
+
+window._openAddHotelModal=()=>{
+  const targetCity=_htlActiveCity==="all"?(S.cities[0]?.key||"makkah"):_htlActiveCity;
+  addH(targetCity);
+};
+
+function rH(){
+  const area=$("htlContentArea");if(!area)return;
+  const canEdit=P("htl","edit"),canDel=P("htl","delete"),ro=!canEdit&&!canDel;
+  const ql=_htlSearchQuery.toLowerCase();
+
+  const citiesToRender=_htlActiveCity==="all"?S.cities:S.cities.filter(c=>c.key===_htlActiveCity);
+
+  let allMatches=[];
+  citiesToRender.forEach(c=>{
+    const list=S.hotels[c.key]||[];
+    list.forEach((h,idx)=>{
+      const matchName=(h.n||"").toLowerCase().includes(ql);
+      const matchDist=(h.d||"").toLowerCase().includes(ql);
+      const matchCity=(c.label||"").toLowerCase().includes(ql);
+      if(!ql||matchName||matchDist||matchCity){
+        allMatches.push({cityKey:c.key,cityLabel:c.label,hotel:h,origIdx:idx});
+      }
+    });
+  });
+
+  if(!allMatches.length){
+    area.innerHTML=`
+      <div class="htl-empty">
+        <div class="empty-ic">🏨</div>
+        <div class="empty-title">No Hotels Found</div>
+        <div class="empty-desc">${_htlSearchQuery?`No hotels match your search "<b>${_esc(_htlSearchQuery)}</b>"`:"This city category currently has no hotels."}</div>
+        ${P("htl","add")?`<button class="btn btn-sm btn-p" style="margin-top:12px" onclick="_openAddHotelModal()">+ Add First Hotel</button>`:""}
+      </div>
+    `;
+    return;
+  }
+
+  // 1. Sort all matches
+  const sortedMatches = sortHotelMatches(allMatches, _htlSortBy);
+  const totalCount = sortedMatches.length;
+
+  // 2. Pagination calculations
+  const totalPages = Math.max(1, Math.ceil(totalCount / _htlPageSize));
+  if(_htlPage > totalPages) _htlPage = totalPages;
+  const startIdx = (_htlPage - 1) * _htlPageSize;
+  const endIdx = startIdx + _htlPageSize;
+  const pageMatches = sortedMatches.slice(startIdx, endIdx);
+
+  if(_htlViewMode==="grid"){
+    let html=`<div class="htl-grid">`;
+    pageMatches.forEach((item)=>{
+      const h=item.hotel;
+      const cLabel=item.cityLabel;
+      const cKey=item.cityKey;
+      const idx=item.origIdx;
+      const stars=inferHotelStars(h);
+      const distObj=parseHotelDistance(h.d);
+      const cityIcon=cKey==="makkah"?"🕋":(cKey==="madina"?"🕌":"🏙️");
+
+      html+=`
+        <div class="htl-card" onclick="quickViewHotel('${_esc(cKey)}',${idx})">
+          <div class="htl-card-media">
+            ${h.img?`<img src="${_esc(h.img)}" alt="${_esc(h.n)}" loading="lazy">`:`<div class="htl-card-placeholder">🏨</div>`}
+            <span class="htl-card-city-badge">${cityIcon} ${_esc(cLabel)}</span>
+            <span class="htl-card-star-badge">${stars}★</span>
+            ${h.d?`<span class="htl-card-dist-badge" title="${_esc(distObj.walkTime)}">📍 ${_esc(h.d)}</span>`:""}
+          </div>
+
+          <div class="htl-card-body">
+            <div class="htl-card-title" title="${_esc(h.n)}">
+              ${_highlightMatch(h.n, _htlSearchQuery)}
+            </div>
+
+            <div class="htl-card-meta">
+              <span class="dist-tag">🚶 ${distObj.walkTime}</span>
+            </div>
+
+            <div class="htl-card-amenities-row">
+              <span class="htl-amenity-chip" title="Free High-Speed WiFi">📶 WiFi</span>
+              ${distObj.isShuttle?`<span class="htl-amenity-chip" title="24/7 Shuttle Bus">🚌 Shuttle</span>`:`<span class="htl-amenity-chip" title="Walking Distance">🚶 Close</span>`}
+              <span class="htl-amenity-chip" title="Elevator / Lift">🛗 Lift</span>
+              <span class="htl-amenity-chip" title="Air Conditioned">❄️ AC</span>
+            </div>
+
+            <div class="htl-card-footer" onclick="event.stopPropagation()">
+              <button type="button" class="htl-action-btn qv-btn" title="Quick View Hotel" onclick="quickViewHotel('${_esc(cKey)}',${idx})">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                <span>View</span>
+              </button>
+
+              <div class="htl-card-btns">
+                <button type="button" class="htl-action-btn" title="Copy Hotel Name" onclick="_copyHotelName('${_esc(h.n)}')">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                </button>
+                ${h.loc?`
+                  <a href="${_esc(h.loc)}" target="_blank" rel="noopener" class="htl-action-btn map-btn" title="Open in Google Maps">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+                  </a>
+                `:""}
+                ${canEdit?`
+                  <button type="button" class="htl-action-btn edit-btn" title="Edit Hotel" onclick="eH('${cKey}',${idx})">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                  </button>
+                `:""}
+                ${canDel?`
+                  <button type="button" class="htl-action-btn del-btn" title="Delete Hotel" onclick="dH('${cKey}',${idx})">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+                  </button>
+                `:""}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    });
+    html+=`</div>`;
+    html+=renderHtlPagination(totalCount, _htlPage, _htlPageSize);
+    area.innerHTML=html;
+  }else{
+    // Table View
+    let html=`
+      <div class="cd tw-fit" style="padding:0;overflow:hidden;border:1px solid var(--bd)">
+        <table class="htl-table" style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr>
+              <th style="width:40px;text-align:center">#</th>
+              <th style="width:50px;text-align:center">Photo</th>
+              <th>Hotel Name</th>
+              <th style="width:110px">City</th>
+              <th style="width:80px;text-align:center">Stars</th>
+              <th style="width:140px">Distance & Walk</th>
+              <th style="width:50px;text-align:center">Map</th>
+              <th style="width:${ro?70:140}px;text-align:right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+    `;
+
+    pageMatches.forEach((item,i)=>{
+      const h=item.hotel;
+      const cLabel=item.cityLabel;
+      const cKey=item.cityKey;
+      const idx=item.origIdx;
+      const rowNum=startIdx + i + 1;
+      const stars=inferHotelStars(h);
+      const distObj=parseHotelDistance(h.d);
+
+      html+=`
+        <tr onclick="quickViewHotel('${_esc(cKey)}',${idx})" style="cursor:pointer">
+          <td style="text-align:center;color:var(--t2);font-weight:700">${rowNum}</td>
+          <td style="text-align:center">
+            <div class="tbl-img-thumb">
+              ${h.img?`<img src="${_esc(h.img)}" alt="${_esc(h.n)}">`:`<span>🏨</span>`}
+            </div>
+          </td>
+          <td>
+            <div style="font-weight:700;color:var(--t1)">${_highlightMatch(h.n, _htlSearchQuery)}</div>
+          </td>
+          <td>
+            <span class="htl-tbl-city-tag">${_esc(cLabel)}</span>
+          </td>
+          <td style="text-align:center">
+            <span class="htl-tbl-star-tag">${stars}★</span>
+          </td>
+          <td style="color:var(--t2);font-weight:600">
+            <div>${_esc(h.d||"—")}</div>
+            <div style="font-size:.68rem;color:var(--t3)">${distObj.walkTime}</div>
+          </td>
+          <td style="text-align:center" onclick="event.stopPropagation()">
+            ${h.loc?`<a href="${_esc(h.loc)}" target="_blank" rel="noopener" class="htl-action-btn map-btn" title="Open Map">📍</a>`:`<span style="color:var(--t3);font-size:.75rem">—</span>`}
+          </td>
+          <td style="text-align:right" onclick="event.stopPropagation()">
+            <div style="display:inline-flex;gap:4px;align-items:center;justify-content:flex-end">
+              <button type="button" class="htl-action-btn qv-btn-sm" title="Quick View Details" onclick="quickViewHotel('${_esc(cKey)}',${idx})">👁️</button>
+              <button type="button" class="htl-action-btn" title="Copy Hotel Name" onclick="_copyHotelName('${_esc(h.n)}')">📋</button>
+              ${canEdit?`<button type="button" class="htl-action-btn edit-btn" title="Edit" onclick="eH('${cKey}',${idx})">✏</button>`:""}
+              ${canDel?`<button type="button" class="htl-action-btn del-btn" title="Delete" onclick="dH('${cKey}',${idx})">🗑</button>`:""}
+            </div>
+          </td>
+        </tr>
+      `;
+    });
+
+    html+=`</tbody></table></div>`;
+    html+=renderHtlPagination(totalCount, _htlPage, _htlPageSize);
+    area.innerHTML=html;
+  }
+}
 window.addCity=()=>{if(!P("htl","add"))return toast("Not allowed","err");showModal("Add City",`<div class="fg"><label>City / Category Name</label><input id="cName" placeholder="e.g. Jeddah, Taif"></div>`,()=>{const nm=$("cName").value.trim();if(!nm)return toast("Enter city name","err")||false;const key=normalizeCityKey(nm);if(S.cities.some(c=>c.key===key))return toast("City already exists","err")||false;S.hotels[key]=[];FR("cities").then(raw=>{const live=(Array.isArray(raw)&&raw.length)?raw.filter(Boolean):S.cities.filter(Boolean);if(!live.some(x=>x&&x.key===key))live.push({key,label:nm});S.cities=live;return Promise.all([bFS("cities",S.cities),bFS("hotels/"+key,{})])}).then(()=>{toast("City added");pgHtl($("CT").firstChild)}).catch(e=>toast("Save failed: "+e.message,"err"));return true})};
 window.delCity=async key=>{if(!P("htl","delete"))return toast("Not allowed","err");if(key==="makkah"||key==="madina")return;confirmModal("Delete city and ALL its hotels? (Stays in Recycle Bin for 7 days)",async()=>{const _cObj=(S.cities.find(x=>x.key===key))||{key,label:key};const _rawH=await FR("hotels/"+key).catch(()=>null);await _trashAdd("city",_cObj.label||key,"City + all hotels","",{city:_cObj,hotels:_rawH},{city:_cObj,hotels:_rawH});let live=S.cities.filter(c=>c.key!==key);try{const raw=await FR("cities");if(Array.isArray(raw)&&raw.length)live=raw.filter(c=>c&&c.key!==key)}catch(e){}S.cities=live;delete S.hotels[key];await Promise.all([bFS("cities",S.cities),bFD("hotels/"+key)]).catch(e=>toast("Delete failed: "+e.message,"err"));toast("City removed");pgHtl($("CT").firstChild)});};
 /* Resize+compress any image to keep DB payloads small (large stored photos were slowing down every load) */
@@ -3665,11 +5258,156 @@ window.hImgPaste=(ev,hiddenId,previewId)=>{
   }
   if(!found){ev.preventDefault();toast("No image found in clipboard — paste an image (Ctrl+V)","warn")}
 };
-window.addH=c=>{if(!P("htl","add"))return toast("Not allowed","err");showModal("Add Hotel",`<div class="fg"><label>Name</label><input id="hName"></div><div class="fg"><label>Distance</label><input id="hDist"></div><div class="fg"><label>Location (Google Maps link)</label><input id="hLoc" placeholder="https://maps.app.goo.gl/..."></div><div class="fg"><label>Hotel Photo (optional — shown on quotations, falls back to 🏨 if empty)</label><input type="file" id="hImgFile" accept="image/*" onchange="hImgPick('hImgFile','hImg','hImgPv')"><div class="paste-zone" tabindex="0" onpaste="hImgPaste(event,'hImg','hImgPv')">📋 Click here and paste an image (Ctrl+V)</div><input type="hidden" id="hImg" value=""><img id="hImgPv" style="display:none;max-width:120px;max-height:90px;object-fit:cover;border-radius:6px;margin-top:6px;border:1px solid var(--bd)"></div>`,()=>{const nm=$("hName").value.trim(),d=$("hDist").value.trim(),loc=$("hLoc").value.trim(),img=$("hImg")?.value||"";if(!nm)return toast("Enter name","err")||false;if(!S.hotels[c])S.hotels[c]=[];
-const _ex=(S.hotels[c]||[]).find(x=>((x.n||"").trim().toUpperCase()===nm.toUpperCase()));
-if(_ex){confirmModal(`"${nm.toUpperCase()}" already exists. Merge new details into existing hotel? (missing distance/location/photo will be added)`,async()=>{_mergeHotelFields(_ex,{d,loc,img});try{if(_ex.id)await bFS("hotels/"+c+"/"+_ex.id,_ex);toast("Merged ✅");rH()}catch(e2){toast("Merge failed: "+e2.message,"err")}},"Merge","btn-p");return true}
-const hotel={n:nm.toUpperCase(),d,loc:loc.replace(/^javascript:/i,''),img};bFP("hotels/"+c,hotel).then(id=>{hotel.id=id;S.hotels[c].push(hotel);toast("Added");rH()}).catch(e=>{toast("Hotel save failed: "+e.message,"err")});return true})};
-window.eH=(c,i)=>{if(!P("htl","edit"))return toast("Not allowed","err");const h=S.hotels[c][i];showModal("Edit",`<div class="fg"><label>Name</label><input id="hName" value="${_esc(h.n)}"></div><div class="fg"><label>Distance</label><input id="hDist" value="${_esc(h.d)}"></div><div class="fg"><label>Location (Google Maps link)</label><input id="hLoc" value="${_esc(h.loc||"")}" placeholder="https://maps.app.goo.gl/..."></div><div class="fg"><label>Hotel Photo (optional — shown on quotations, falls back to 🏨 if empty)</label><input type="file" id="hImgFile" accept="image/*" onchange="hImgPick('hImgFile','hImg','hImgPv')"><div class="paste-zone" tabindex="0" onpaste="hImgPaste(event,'hImg','hImgPv')">📋 Click here and paste an image (Ctrl+V)</div><input type="hidden" id="hImg" value="${h.img||""}">${h.img?`<div><button type="button" class="btn btn-sm btn-o" style="margin-top:6px" onclick="$('hImg').value='';$('hImgPv').style.display='none'">Remove Photo</button></div>`:""}<img id="hImgPv" style="${h.img?"display:block":"display:none"};max-width:120px;max-height:90px;object-fit:cover;border-radius:6px;margin-top:6px;border:1px solid var(--bd)" src="${h.img||""}"></div>`,()=>{const nm=$("hName").value.trim(),d=$("hDist").value.trim(),loc=$("hLoc").value.trim(),img=$("hImg")?.value||"";if(!nm)return toast("Enter name","err")||false;const id=h.id;const safeLoc=loc.replace(/^javascript:/i,'');const updated={n:nm.toUpperCase(),d,loc:safeLoc,img,id};const p=id?bFS_Long2("hotels/"+c+"/"+id,updated):(async()=>{updated.id=_newHotelId();S.hotels[c][i]=updated;await _safeArrWrite("hotels/"+c,S.hotels[c],a=>a.filter(x=>x&&x.id!==updated.id).concat(updated))})();p.then(()=>{S.hotels[c][i]=updated;toast("Updated");rH()}).catch(e=>toast("Update failed: "+e.message,"err"));return true})};
+window.addH=c=>{
+  if(!P("htl","add"))return toast("Not allowed","err");
+  showModal("Add Hotel",`
+    <div class="fg">
+      <label>City / Location</label>
+      <select id="hCity">${S.cities.map(ct=>`<option value="${_esc(ct.key)}" ${ct.key===c?'selected':''}>${ct.key==='makkah'?'🕋':(ct.key==='madina'?'🕌':'🏙️')} ${_esc(ct.label)}</option>`).join("")}</select>
+    </div>
+    <div class="fg">
+      <label>Hotel Name</label>
+      <input id="hName" placeholder="e.g. PULLMAN ZAMZAM MAKKAH">
+    </div>
+    <div class="g2">
+      <div class="fg">
+        <label>Star Rating ⭐</label>
+        <select id="hStars">
+          <option value="auto">✨ Auto Detect (by Brand/Distance)</option>
+          <option value="5">⭐⭐⭐⭐⭐ 5 Star Luxury</option>
+          <option value="4">⭐⭐⭐⭐ 4 Star Premium</option>
+          <option value="3">⭐⭐⭐ 3 Star Standard</option>
+          <option value="2">⭐⭐ 2 Star Economy</option>
+          <option value="1">⭐ 1 Star Basic</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>Distance from Haram</label>
+        <input id="hDist" placeholder="e.g. 0m, 150m, 500m Shuttle">
+      </div>
+    </div>
+    <div class="fg">
+      <label>Location (Google Maps link)</label>
+      <input id="hLoc" placeholder="https://maps.app.goo.gl/...">
+    </div>
+    <div class="fg">
+      <label>Hotel Photo (optional — shown on quotations & quick view)</label>
+      <input type="file" id="hImgFile" accept="image/*" onchange="hImgPick('hImgFile','hImg','hImgPv')">
+      <div class="paste-zone" tabindex="0" onpaste="hImgPaste(event,'hImg','hImgPv')">📋 Click here and paste an image (Ctrl+V)</div>
+      <input type="hidden" id="hImg" value="">
+      <img id="hImgPv" style="display:none;max-width:120px;max-height:90px;object-fit:cover;border-radius:6px;margin-top:6px;border:1px solid var(--bd)">
+    </div>
+  `,()=>{
+    const selCity=$("hCity")?.value||c;
+    const nm=$("hName").value.trim();
+    const d=$("hDist").value.trim();
+    const loc=$("hLoc").value.trim();
+    const starsVal=$("hStars")?.value;
+    const stars=starsVal==="auto"?null:parseInt(starsVal,10);
+    const img=$("hImg")?.value||"";
+
+    if(!nm)return toast("Enter hotel name","err")||false;
+    if(!S.hotels[selCity])S.hotels[selCity]=[];
+
+    const _ex=(S.hotels[selCity]||[]).find(x=>((x.n||"").trim().toUpperCase()===nm.toUpperCase()));
+    if(_ex){
+      confirmModal(`"${nm.toUpperCase()}" already exists in ${_esc(selCity)}. Merge new details into existing hotel?`,async()=>{
+        _mergeHotelFields(_ex,{d,loc,img,stars});
+        try{
+          if(_ex.id)await bFS("hotels/"+selCity+"/"+_ex.id,_ex);
+          toast("Merged ✅");
+          rH();
+        }catch(e2){
+          toast("Merge failed: "+e2.message,"err");
+        }
+      },"Merge","btn-p");
+      return true;
+    }
+
+    const hotel={n:nm.toUpperCase(),d,loc:loc.replace(/^javascript:/i,''),img};
+    if(stars)hotel.stars=stars;
+
+    bFP("hotels/"+selCity,hotel).then(id=>{
+      hotel.id=id;
+      S.hotels[selCity].push(hotel);
+      toast("Added ✅");
+      rH();
+    }).catch(e=>{
+      toast("Hotel save failed: "+e.message,"err");
+    });
+    return true;
+  });
+};
+
+window.eH=(c,i)=>{
+  if(!P("htl","edit"))return toast("Not allowed","err");
+  const h=S.hotels[c][i];
+  const currentStars=h.stars||inferHotelStars(h);
+
+  showModal("Edit: "+_esc(h.n),`
+    <div class="fg">
+      <label>Hotel Name</label>
+      <input id="hName" value="${_esc(h.n)}">
+    </div>
+    <div class="g2">
+      <div class="fg">
+        <label>Star Rating ⭐</label>
+        <select id="hStars">
+          <option value="auto" ${!h.stars?'selected':''}>✨ Auto Detect (Currently ${currentStars}★)</option>
+          <option value="5" ${h.stars===5?'selected':''}>⭐⭐⭐⭐⭐ 5 Star Luxury</option>
+          <option value="4" ${h.stars===4?'selected':''}>⭐⭐⭐⭐ 4 Star Premium</option>
+          <option value="3" ${h.stars===3?'selected':''}>⭐⭐⭐ 3 Star Standard</option>
+          <option value="2" ${h.stars===2?'selected':''}>⭐⭐ 2 Star Economy</option>
+          <option value="1" ${h.stars===1?'selected':''}>⭐ 1 Star Basic</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>Distance from Haram</label>
+        <input id="hDist" value="${_esc(h.d||"")}">
+      </div>
+    </div>
+    <div class="fg">
+      <label>Location (Google Maps link)</label>
+      <input id="hLoc" value="${_esc(h.loc||"")}" placeholder="https://maps.app.goo.gl/...">
+    </div>
+    <div class="fg">
+      <label>Hotel Photo (optional — shown on quotations & quick view)</label>
+      <input type="file" id="hImgFile" accept="image/*" onchange="hImgPick('hImgFile','hImg','hImgPv')">
+      <div class="paste-zone" tabindex="0" onpaste="hImgPaste(event,'hImg','hImgPv')">📋 Click here and paste an image (Ctrl+V)</div>
+      <input type="hidden" id="hImg" value="${h.img||""}">
+      ${h.img?`<div><button type="button" class="btn btn-sm btn-o" style="margin-top:6px" onclick="$('hImg').value='';$('hImgPv').style.display='none'">Remove Photo</button></div>`:""}
+      <img id="hImgPv" style="${h.img?"display:block":"display:none"};max-width:120px;max-height:90px;object-fit:cover;border-radius:6px;margin-top:6px;border:1px solid var(--bd)" src="${h.img||""}">
+    </div>
+  `,()=>{
+    const nm=$("hName").value.trim();
+    const d=$("hDist").value.trim();
+    const loc=$("hLoc").value.trim();
+    const starsVal=$("hStars")?.value;
+    const stars=starsVal==="auto"?null:parseInt(starsVal,10);
+    const img=$("hImg")?.value||"";
+
+    if(!nm)return toast("Enter hotel name","err")||false;
+    const id=h.id;
+    const safeLoc=loc.replace(/^javascript:/i,'');
+    const updated={...h,n:nm.toUpperCase(),d,loc:safeLoc,img};
+    if(stars)updated.stars=stars;
+    else delete updated.stars;
+
+    const p=id?bFS_Long2("hotels/"+c+"/"+id,updated):(async()=>{
+      updated.id=_newHotelId();
+      S.hotels[c][i]=updated;
+      await _safeArrWrite("hotels/"+c,S.hotels[c],a=>a.filter(x=>x&&x.id!==updated.id).concat(updated));
+    })();
+
+    p.then(()=>{
+      S.hotels[c][i]=updated;
+      toast("Updated ✅");
+      rH();
+    }).catch(e=>toast("Update failed: "+e.message,"err"));
+    return true;
+  });
+};
+
 window.dH=async(c,i)=>{if(!P("htl","delete"))return toast("Not allowed","err");confirmModal("Delete this hotel? (Stays in Recycle Bin for 7 days)",async()=>{const h=S.hotels[c][i];const removed=S.hotels[c].splice(i,1)[0];await _trashAdd("hotel",(removed&&removed.n)||"Hotel",(S.cities.find(x=>x.key===c)||{}).label||c,h&&h.id?("hotels/"+c+"/"+h.id):"",removed,{city:c});try{if(h&&h.id)await bFD("hotels/"+c+"/"+h.id);else await _safeArrWrite("hotels/"+c,S.hotels[c],a=>a.filter(x=>x&&x.id!==(removed&&removed.id)));toast("Deleted");pgHtl($("CT").firstChild)}catch(e){toast("Delete failed: "+e.message,"err");S.hotels[c].splice(i,0,removed)}});};
 function parseHotelImport(raw,defaultCityKey){const lines=raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);const buckets={};let count=0;
 lines.forEach(line=>{const cols=line.includes("\t")?line.split("\t"):line.split(",");const parts=cols.map(x=>x.trim());if(!parts.length)return;let name="",dist="",city="",loc="";
@@ -3755,7 +5493,7 @@ window.emptyBin=()=>{const items=_trashAlive();if(!items.length)return toast("Bi
 /* ===== DUPLICATE FINDER (Hotels) =====
    Same city mein same naam ke hotels detect hotay hain. User ki marzi:
    MERGE (missing details existing mein daal do), DELETE DUPLICATE, ya SKIP. */
-function _mergeHotelFields(target,src){let changed=false;["d","loc","img"].forEach(f=>{if(src&&src[f]&&!target[f]){target[f]=src[f];changed=true}});return changed}
+function _mergeHotelFields(target,src){let changed=false;["d","loc","img","stars"].forEach(f=>{if(src&&src[f]&&!target[f]){target[f]=src[f];changed=true}});return changed}
 let _skippedHotelDupes=new Set();
 function _findLiveDupes(){const out=[];S.cities.forEach(c=>{const list=S.hotels[c.key]||[];const seen={};list.forEach((h,i)=>{const k=(h.n||"").trim().toUpperCase();if(!k)return;if(seen[k]!==undefined){const skipKey=`${c.key}::${list[seen[k]].id||seen[k]}::${h.id||i}`;if(_skippedHotelDupes.has(skipKey))return;out.push({city:c.key,cityLabel:c.label,keep:list[seen[k]],dupe:h,skipKey})}else seen[k]=i})});return out}
 let _dupesCtx=null;
@@ -4281,26 +6019,217 @@ window.rstAll=()=>{showModal("Reset",`<p style="color:var(--er)">Delete ALL quot
 setTimeout(()=>{$("lgU")?.addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();$("lgP").focus()}})},100);
 window.addEventListener("resize",()=>{if(innerWidth>=769){$("SB").classList.remove("closed");$("SB").classList.remove("open");$("sbOv").classList.remove("show")}else{if(!$("SB").classList.contains("open"))$("SB").classList.add("closed")}});
 
-/* ===== GLOBAL SEARCH ===== */
+/* ===== GLOBAL SEARCH WITH HIGHLIGHTING ===== */
+function _highlightMatch(text, query){
+  if(!text)return "";
+  if(!query)return _esc(text);
+  const qClean=query.trim();
+  if(!qClean)return _esc(text);
+  const safeStr=String(text);
+  const words=qClean.split(/\s+/).filter(Boolean).map(w=>w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
+  if(!words.length)return _esc(safeStr);
+  const regex=new RegExp(`(${words.join('|')})`,'gi');
+  const parts=safeStr.split(regex);
+  return parts.map(p=>{
+    if(words.some(w=>new RegExp(`^${w}$`,'i').test(p))){
+      return `<mark class="gs-highlight">${_esc(p)}</mark>`;
+    }
+    return _esc(p);
+  }).join("");
+}
+
 let _gsTimer=null;
-function gSearchInit(){const inp=$("gSearch"),dd=$("gSearchResults");if(!inp||!dd)return;
-inp.addEventListener("input",()=>{clearTimeout(_gsTimer);const q=inp.value.trim();if(!q){dd.classList.remove("show");dd.innerHTML="";return}_gsTimer=setTimeout(()=>gSearchRun(q),200)});
-inp.addEventListener("keydown",e=>{if(e.key==="Escape"){dd.classList.remove("show");inp.blur()}if(e.key==="Enter"){const first=dd.querySelector(".gs-item");if(first)first.click()}});
-document.addEventListener("click",e=>{if(!e.target.closest(".gsearch-wrap"))dd.classList.remove("show")})}
-function gSearchRun(q){const dd=$("gSearchResults");if(!dd)return;const ql=q.toLowerCase();const results=[];
-const seeAll=P("allquot","view");const entries=Object.entries(S.quotations||{});
-const myQ=seeAll?entries:entries.filter(([k,v])=>v.createdBy===S.user.u);
-myQ.forEach(([k,v])=>{const cn=(v.clientName||"").toLowerCase(),inv=(v.invoiceNo||"").toLowerCase(),ct=(v.contactNo||"").toLowerCase();
-if(cn.includes(ql)||inv.includes(ql)||ct.includes(ql)){results.push({type:"quot",icon:v.type==="group"?"👥":"📝",title:v.clientName||"—",sub:`${v.invoiceNo||""} • ${v.type} • PKR ${fmt(v.totalAdult||0)}`,key:k})}});
-Object.entries(S.hotels||{}).forEach(([city,list])=>{(list||[]).forEach((h,i)=>{if((h.n||"").toLowerCase().includes(ql)){const cLabel=(S.cities.find(c=>c.key===city)||{}).label||city;results.push({type:"hotel",icon:"🏨",title:h.n,sub:`${cLabel} • ${h.d||""}`,city,idx:i})}})});
-if(results.length>20)results.length=20;
-gSearchRender(results,q)}
-function gSearchRender(results,q){const dd=$("gSearchResults");if(!dd)return;
-if(!results.length){dd.innerHTML=`<div class="gs-empty">No results for "${_esc(q)}"</div>`;dd.classList.add("show");return}
-dd.innerHTML=results.map((r,i)=>`<div class="gs-item" data-idx="${i}" data-type="${r.type}" data-key="${r.key||""}" data-city="${r.city||""}"><span class="gs-ic">${r.icon}</span><div class="gs-info"><div class="gs-title">${_esc(r.title)}</div><div class="gs-sub">${_esc(r.sub)}</div></div></div>`).join("");
-dd.classList.add("show");
-dd.querySelectorAll(".gs-item").forEach(el=>{el.addEventListener("click",()=>{const t=el.dataset.type;if(t==="quot"){const k=el.dataset.key;viewQ(k)}else if(t==="hotel"){nav("htl")}
-dd.classList.remove("show");$("gSearch").value=""})})}
+let _gsSelectedIndex=-1;
+
+function gSearchInit(){
+  const inp=$("gSearch"),dd=$("gSearchResults");
+  if(!inp||!dd)return;
+  inp.addEventListener("input",()=>{
+    clearTimeout(_gsTimer);
+    const q=inp.value.trim();
+    if(!q){
+      dd.classList.remove("show");
+      dd.innerHTML="";
+      _gsSelectedIndex=-1;
+      return;
+    }
+    _gsTimer=setTimeout(()=>gSearchRun(q),150);
+  });
+
+  inp.addEventListener("keydown",e=>{
+    if(e.key==="Escape"){
+      dd.classList.remove("show");
+      inp.blur();
+      _gsSelectedIndex=-1;
+    }else if(e.key==="ArrowDown"){
+      e.preventDefault();
+      const items=dd.querySelectorAll(".gs-item");
+      if(!items.length)return;
+      _gsSelectedIndex=(_gsSelectedIndex+1)%items.length;
+      items.forEach((it,idx)=>it.classList.toggle("selected",idx===_gsSelectedIndex));
+      items[_gsSelectedIndex]?.scrollIntoView({block:"nearest"});
+    }else if(e.key==="ArrowUp"){
+      e.preventDefault();
+      const items=dd.querySelectorAll(".gs-item");
+      if(!items.length)return;
+      _gsSelectedIndex=_gsSelectedIndex<=0?items.length-1:_gsSelectedIndex-1;
+      items.forEach((it,idx)=>it.classList.toggle("selected",idx===_gsSelectedIndex));
+      items[_gsSelectedIndex]?.scrollIntoView({block:"nearest"});
+    }else if(e.key==="Enter"){
+      e.preventDefault();
+      const items=dd.querySelectorAll(".gs-item");
+      if(_gsSelectedIndex>=0&&items[_gsSelectedIndex]){
+        items[_gsSelectedIndex].click();
+      }else if(items.length){
+        items[0].click();
+      }
+    }
+  });
+
+  document.addEventListener("click",e=>{
+    if(!e.target.closest(".gsearch-wrap")){
+      dd.classList.remove("show");
+      _gsSelectedIndex=-1;
+    }
+  });
+}
+
+function gSearchRun(q){
+  const dd=$("gSearchResults");if(!dd)return;
+  const ql=q.toLowerCase();
+  const results=[];
+  _gsSelectedIndex=-1;
+
+  const seeAll=P("allquot","view");
+  const entries=Object.entries(S.quotations||{});
+  const myQ=seeAll?entries:entries.filter(([k,v])=>v.createdBy===S.user.u);
+
+  /* 1. Search Quotations */
+  myQ.forEach(([k,v])=>{
+    const cn=v.clientName||"";
+    const inv=v.invoiceNo||"";
+    const ct=v.contactNo||"";
+    const air=v.airline||"";
+    const br=v.branchName||"";
+
+    const matchCN=cn.toLowerCase().includes(ql);
+    const matchInv=inv.toLowerCase().includes(ql);
+    const matchCt=ct.toLowerCase().includes(ql);
+    const matchAir=air.toLowerCase().includes(ql);
+    const matchBr=br.toLowerCase().includes(ql);
+
+    if(matchCN||matchInv||matchCt||matchAir||matchBr){
+      const reason=[];
+      if(matchCN)reason.push("Client Name");
+      if(matchInv)reason.push("Invoice #");
+      if(matchCt)reason.push("Contact");
+      if(matchAir)reason.push("Airline");
+      if(matchBr)reason.push("Branch");
+
+      results.push({
+        type:"quot",
+        tag:v.type==="group"?"Group Quotation":"Private Quotation",
+        icon:v.type==="group"?"👥":"📝",
+        title:cn||"—",
+        titleH:_highlightMatch(cn||"—",q),
+        sub:`${inv?inv+" • ":""}${v.type} • PKR ${fmt(v.totalAdult||0)}${br?" • "+br:""}`,
+        subH:`${inv?_highlightMatch(inv,q)+" • ":""}${v.type} • PKR ${fmt(v.totalAdult||0)}${br?" • "+_highlightMatch(br,q):""}`,
+        reason:reason.join(", "),
+        key:k
+      });
+    }
+  });
+
+  /* 2. Search Hotels */
+  Object.entries(S.hotels||{}).forEach(([city,list])=>{
+    const cLabel=(S.cities.find(c=>c.key===city)||{}).label||city;
+    (list||[]).forEach((h,i)=>{
+      const hn=h.n||"";
+      const hd=h.d||"";
+      const matchName=hn.toLowerCase().includes(ql);
+      const matchDist=hd.toLowerCase().includes(ql);
+      const matchCity=cLabel.toLowerCase().includes(ql);
+
+      if(matchName||matchDist||matchCity){
+        const reason=[];
+        if(matchName)reason.push("Hotel Name");
+        if(matchDist)reason.push("Distance: "+hd);
+        if(matchCity)reason.push("City: "+cLabel);
+
+        results.push({
+          type:"hotel",
+          tag:cLabel,
+          icon:"🏨",
+          title:hn,
+          titleH:_highlightMatch(hn,q),
+          sub:`${cLabel} • Distance: ${hd||"N/A"}`,
+          subH:`${_highlightMatch(cLabel,q)} • Distance: ${_highlightMatch(hd||"N/A",q)}`,
+          reason:reason.join(", "),
+          city,
+          idx:i
+        });
+      }
+    });
+  });
+
+  /* 3. Search Transport Sectors */
+  (S.transports||[]).forEach(t=>{
+    const sec=t.sec||"";
+    if(sec.toLowerCase().includes(ql)){
+      results.push({
+        type:"transport",
+        tag:"Transport",
+        icon:"🚐",
+        title:sec,
+        titleH:_highlightMatch(sec,q),
+        sub:`Vehicle: ${t.veh||"All"} • Notes: ${t.notes||"Standard sector"}`,
+        subH:`Vehicle: ${t.veh||"All"} • Notes: ${_highlightMatch(t.notes||"Standard sector",q)}`,
+        reason:"Transport Sector"
+      });
+    }
+  });
+
+  if(results.length>25)results.length=25;
+  gSearchRender(results,q);
+}
+
+function gSearchRender(results,q){
+  const dd=$("gSearchResults");if(!dd)return;
+  if(!results.length){
+    dd.innerHTML=`<div class="gs-empty">No results matching "<b>${_esc(q)}</b>"</div>`;
+    dd.classList.add("show");
+    return;
+  }
+  let html=`<div class="gs-header"><span>Found <b>${results.length}</b> matches</span><span class="gs-esc-hint">Esc to close</span></div>`;
+  html+=results.map((r,i)=>`
+    <div class="gs-item" data-idx="${i}" data-type="${r.type}" data-key="${r.key||""}" data-city="${r.city||""}">
+      <span class="gs-ic">${r.icon}</span>
+      <div class="gs-info">
+        <div class="gs-title">${r.titleH} <span class="gs-tag">${_esc(r.tag)}</span></div>
+        <div class="gs-sub">${r.subH} ${r.reason?`<span style="opacity:.7">• Matched in ${r.reason}</span>`:""}</div>
+      </div>
+    </div>
+  `).join("");
+  dd.innerHTML=html;
+  dd.classList.add("show");
+
+  dd.querySelectorAll(".gs-item").forEach(el=>{
+    el.addEventListener("click",()=>{
+      const t=el.dataset.type;
+      if(t==="quot"){
+        const k=el.dataset.key;
+        viewQ(k);
+      }else if(t==="hotel"){
+        nav("htl");
+      }else if(t==="transport"){
+        nav("trn");
+      }
+      dd.classList.remove("show");
+      $("gSearch").value="";
+      _gsSelectedIndex=-1;
+    });
+  });
+}
 
 /* ===== EXCEL/CSV EXPORT ===== */
 window.exportQuotCSV=(filterFn,filename)=>{const entries=Object.entries(S.quotations||{}).filter(([k,v])=>filterFn(v));
@@ -4383,5 +6312,189 @@ document.addEventListener("visibilitychange",async()=>{
 });
 window.addEventListener("blur",()=>autoSaveDraftNow());
 window.addEventListener("beforeunload",()=>autoSaveDraftNow());
+
+/* ===== GLOBAL KEYBOARD SHORTCUTS ENGINE =====
+   Provides power-user hotkeys across the entire application:
+   - Ctrl + S / Cmd + S: Save quotation draft instantly with calculations
+   - Ctrl + P / Cmd + P: Open quotation Print Preview modal (or print if preview is open)
+   - Ctrl + Enter: Save & Print official quotation
+   - Ctrl + K / Cmd + K: Focus global search
+   - Ctrl + / or ?: Open Keyboard Shortcuts cheatsheet modal
+   - Esc: Close print overlay, search dropdown, or active modals
+   - Alt + P/G/Q/D: Quick navigation to Private, Group, Quotations list, or Dashboard
+*/
+window.saveQuotationDraftShortcut=function(forcedPt){
+  const pt=forcedPt||draftPageType();
+  if(!pt){
+    toast("💡 Tip: 'Ctrl + S' saves quotation drafts on Private & Group pages. Press 'Ctrl + /' for shortcuts.","info");
+    return;
+  }
+  try{
+    if(pt==="pvt"){
+      pCalc(true);
+    }else if(pt==="grp"){
+      gCalc(true);
+    }
+    autoSaveDraftNow();
+    const cName=pt==="pvt"?($("pN")?.value?.trim()||""):($("gN")?.value?.trim()||"");
+    const typeLabel=pt==="pvt"?"Private Package":"Group Package";
+    toast(`💾 Draft saved: ${typeLabel}${cName?" ("+cName+")":""} ✓`);
+  }catch(e){
+    toast("Draft save failed: "+e.message,"err");
+  }
+};
+
+window.openPrintPreviewShortcut=function(){
+  const po=$("printOverlay");
+  if(po&&po.classList.contains("active")){
+    toast("Opening print dialog...","info");
+    window.doPrintNow();
+    return;
+  }
+  if(document.querySelector("#pTP")||$("pN")){
+    pPreview();
+    return;
+  }
+  if(document.querySelector("#gRes")||$("gN")){
+    gPreview();
+    return;
+  }
+  toast("💡 Open a Private or Group quotation to preview (or press Ctrl + / for shortcuts)","info");
+};
+
+window.showKeyboardShortcutsModal=function(){
+  const isMac=navigator.platform.toUpperCase().indexOf('MAC')>=0;
+  const cmdKey=isMac?"⌘":"Ctrl";
+  const altKey=isMac?"⌥":"Alt";
+  
+  const html=`
+    <div style="font-size:.82rem;line-height:1.4">
+      <div class="kb-cat">⚡ Quotation & Form Actions</div>
+      <table class="kb-table">
+        <tr><td><kbd>${cmdKey}</kbd> + <kbd>S</kbd></td><td><b>Save quotation draft</b> immediately to storage</td></tr>
+        <tr><td><kbd>${cmdKey}</kbd> + <kbd>P</kbd></td><td><b>Open Print Preview modal</b> (or print if preview open)</td></tr>
+        <tr><td><kbd>${cmdKey}</kbd> + <kbd>Enter</kbd></td><td><b>Save &amp; Print</b> official quotation</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Close Print Preview overlay or active modal dialog</td></tr>
+      </table>
+
+      <div class="kb-cat">🧭 Quick Navigation & Search</div>
+      <table class="kb-table">
+        <tr><td><kbd>${cmdKey}</kbd> + <kbd>K</kbd></td><td>Focus Global Search (quotations, hotels, clients)</td></tr>
+        <tr><td><kbd>${altKey}</kbd> + <kbd>P</kbd></td><td>Navigate to Private Package Form</td></tr>
+        <tr><td><kbd>${altKey}</kbd> + <kbd>G</kbd></td><td>Navigate to Group Package Form</td></tr>
+        <tr><td><kbd>${altKey}</kbd> + <kbd>Q</kbd></td><td>Navigate to My Quotations list</td></tr>
+        <tr><td><kbd>${altKey}</kbd> + <kbd>D</kbd></td><td>Navigate to Dashboard</td></tr>
+      </table>
+
+      <div class="kb-cat">ℹ️ Help & Cheatsheet</div>
+      <table class="kb-table">
+        <tr><td><kbd>${cmdKey}</kbd> + <kbd>/</kbd> or <kbd>?</kbd></td><td>Open this Keyboard Shortcuts cheatsheet</td></tr>
+      </table>
+    </div>
+  `;
+  showModal("⌨️ Global Keyboard Shortcuts",html,()=>{},"Got it");
+};
+
+function initGlobalKeyboardShortcuts(){
+  window.addEventListener("keydown",function(e){
+    const isCmdOrCtrl=e.ctrlKey||e.metaKey;
+    const key=e.key;
+    const tag=e.target?.tagName||"";
+    const isTyping=tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT"||e.target?.isContentEditable;
+
+    // 1. Ctrl + S (Save Draft)
+    if(isCmdOrCtrl&&!e.shiftKey&&(key==="s"||key==="S")){
+      e.preventDefault();
+      saveQuotationDraftShortcut();
+      return;
+    }
+
+    // 2. Ctrl + P (Print Preview / Print)
+    if(isCmdOrCtrl&&!e.shiftKey&&(key==="p"||key==="P")){
+      e.preventDefault();
+      openPrintPreviewShortcut();
+      return;
+    }
+
+    // 3. Ctrl + K (Global Search)
+    if(isCmdOrCtrl&&!e.shiftKey&&(key==="k"||key==="K")){
+      e.preventDefault();
+      const gs=$("gSearch");
+      if(gs){
+        gs.focus();
+        gs.select();
+      }
+      return;
+    }
+
+    // 4. Ctrl + / or Cmd + / (Shortcuts modal)
+    if(isCmdOrCtrl&&(key==="/"||key==="?")){
+      e.preventDefault();
+      showKeyboardShortcutsModal();
+      return;
+    }
+
+    // 5. '?' pressed outside of input/textarea fields
+    if(key==="?"&&!isCmdOrCtrl&&!e.altKey&&!isTyping){
+      e.preventDefault();
+      showKeyboardShortcutsModal();
+      return;
+    }
+
+    // 6. Ctrl + Enter (Save & Print official quotation)
+    if(isCmdOrCtrl&&key==="Enter"){
+      if(document.querySelector("#pTP")||$("pN")){
+        e.preventDefault();
+        pSave();
+        return;
+      }
+      if(document.querySelector("#gRes")||$("gN")){
+        e.preventDefault();
+        gSave();
+        return;
+      }
+    }
+
+    // 7. Escape (Close Overlays / Modals / Search dropdown)
+    if(key==="Escape"){
+      const po=$("printOverlay");
+      if(po&&po.classList.contains("active")){
+        e.preventDefault();
+        closePrintPreview();
+        return;
+      }
+      if($("MD")&&$("MD").children.length>0){
+        e.preventDefault();
+        closeModal();
+        return;
+      }
+      const gsr=$("gSearchResults");
+      if(gsr&&gsr.classList.contains("show")){
+        gsr.classList.remove("show");
+        return;
+      }
+    }
+
+    // 8. Alt + Shortcuts (Fast view navigation)
+    if(e.altKey&&!isCmdOrCtrl){
+      const lk=key.toLowerCase();
+      if(lk==="p"){
+        e.preventDefault();
+        nav("pvt");
+      }else if(lk==="g"){
+        e.preventDefault();
+        nav("grp");
+      }else if(lk==="q"){
+        e.preventDefault();
+        nav("quot");
+      }else if(lk==="d"){
+        e.preventDefault();
+        nav("dash");
+      }
+    }
+  });
+}
+
+initGlobalKeyboardShortcuts();
 
 boot();
